@@ -1,0 +1,67 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# C extensions
+*.obj
+*.o
+
+# Distribution / packaging
+# Note: backend/dist and ui/dist are INTENTIONALLY kept tracked
+# so the web dashboard runs immediately without needing Node.js or npm!
+
+# PyInstaller / Virtual Environments
+.env
+.env.*
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Node.js build dependencies (rebuildable via npm install)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Runtime SQLite Databases & temporary files
+*.db
+*.db-wal
+*.db-shm
+*.db.bak
+*.sqlite
+*.sqlite3
+
+# Snapshots & live temp captures
+backend/snapshots/
+snapshots/
+temp/
+*.tmp
+
+# Sensitive keys and secrets
+.service-key
+secrets/
+*.pem
+*.key
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo

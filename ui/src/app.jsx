@@ -1,0 +1,2171 @@
+/* Vehicle Journey Tracker — full React SPA
+   Features:
+   - Dynamic Camera Grid: 1 feed (focus), 2 feeds (entry + exit), or all 4 feeds, with add/remove slot controls and auto-enlarge
+   - Full-screen mode for any camera stream
+   - Continuous background GPU inference across all cameras
+   - Vehicle Journeys table with smart camera-wise filtering, status filtering, and pagination (eliminates vertical stretching)
+   - Clickable Plate Sightings lightbox modal showing vehicle crop, plate crop, timestamp, and confidence
+   - Live KPI cards, engine status, and journey rules
+*/
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import ReactDOM from 'react-dom/client';
+import './theme.css';
+import * as XLSX from 'xlsx';
+
+const API = '/api';
+const POLL_INTERVAL = 3000;
+
+/* ── Helpers ─────────────────────────────────────────────── */
+
+function ts(ms) {
+  if (!ms) return '—';
+  const d = new Date(ms);
+  return d.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+}
+
+function tsDate(ms) {
+  if (!ms) return '—';
+  const d = new Date(ms);
+  return d.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric' }) + ' ' + ts(ms);
+}
+
+function dwell(ms) {
+  if (!ms && ms !== 0) return '—';
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${s % 60}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
+function roleColor(role) {
+  if (role === 'entry') return 'var(--teal)';
+  if (role === 'exit') return 'var(--gold)';
+  return 'var(--purple)';
+}
+
+async function api(path, body) {
+  const options = body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {};
+  const res = await fetch(`${API}${path}`, options);
+  return res.json();
+}
+
+/* ── KPI Card ────────────────────────────────────────────── */
+
+function KpiCard({ label, value, sub, color }) {
+  return (
+    <div className="kpi" style={{ '--kpi': color }}>
+      <span>{label}</span>
+      <b>{value ?? '—'}</b>
+      {sub && <small>{sub}</small>}
+    </div>
+  );
+}
+
+/* ── Fullscreen Stream Modal ──────────────────────────────── */
+
+function FullscreenModal({ stream, device, worker, onClose }) {
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [onClose]);
+
+  if (!stream) return null;
+
+  const fps = worker?.fps ?? 0;
+  const plates = worker?.plates ?? 0;
+
+  return (
+    <div className="fullscreen-stage">
+      <div className="fullscreen-bar">
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <span style={{ fontSize: 16, fontWeight: 800, color: '#fff' }}>
+            📹 {device?.name || stream}
+          </span>
+          {device?.role && (
+            <span className={`badge ${device.role}`} style={{ fontSize: 10, padding: '4px 10px' }}>
+              {device.role.toUpperCase()}
+            </span>
+          )}
+          <span style={{ fontSize: 12, fontWeight: 700, color: '#22a06e', background: 'rgba(34,160,110,.15)', padding: '4px 10px', borderRadius: 8 }}>
+            🟢 {fps} FPS
+          </span>
+          {plates > 0 ? (
+            <span className="badge on_site" style={{ fontSize: 10 }}>{plates} DETECTED</span>
+          ) : (
+            <span className="badge on_site" style={{ fontSize: 10 }}>SCANNING</span>
+          )}
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+          <small style={{ color: '#8ca0bc', fontSize: 11 }}>Press [ESC] or click to exit</small>
+          <button className="btn primary sm" onClick={onClose} style={{ fontSize: 11, padding: '7px 14px' }}>
+            ✕ Exit Fullscreen
+          </button>
+        </div>
+      </div>
+      <div className="fullscreen-body" onClick={onClose}>
+        <img
+          src={`${API}/devices/${stream}/stream.mjpg`}
+          alt={device?.name || stream}
+          onClick={(e) => e.stopPropagation()}
+        />
+      </div>
+    </div>
+  );
+}
+
+/* ── Plate Sighting Lightbox Modal ────────────────────────── */
+
+function SightingModal({ sighting, deviceMap, onClose }) {
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [onClose]);
+
+  if (!sighting) return null;
+
+  const device = deviceMap[sighting.stream];
+  const photoUrl = sighting.photo_url ? `${API}${sighting.photo_url}` : null;
+  const plateUrl = sighting.id ? `${API}/sightings/${sighting.id}/plate` : null;
+  const confPct = sighting.confidence != null ? Math.round(sighting.confidence * 100) : null;
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-box" style={{ width: 620, maxWidth: '94vw' }} onClick={e => e.stopPropagation()}>
+        {/* Modal Head */}
+        <div style={{
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          padding: '16px 20px', borderBottom: '1px solid #eef2f7', background: '#fbfcfe'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <span style={{ fontSize: 20 }}>🚗</span>
+            <div>
+              <h3 style={{ margin: 0, fontSize: 15, fontWeight: 800, color: '#172138' }}>
+                Plate Sighting Detection
+              </h3>
+              <small style={{ color: '#8ca0bc', fontSize: 11 }}>
+                Camera Snapshot & License Plate Capture
+              </small>
+            </div>
+          </div>
+          <button className="btn sm" onClick={onClose} style={{ borderRadius: '50%', width: 32, height: 32, padding: 0 }}>
+            ✕
+          </button>
+        </div>
+
+        {/* Modal Body */}
+        <div style={{ padding: '20px' }}>
+          {/* Main Vehicle Photo Preview */}
+          <div style={{
+            background: '#0b1220', borderRadius: 12, overflow: 'hidden',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            minHeight: 240, maxHeight: 380, border: '1px solid #233146', marginBottom: 16
+          }}>
+            {photoUrl ? (
+              <img
+                src={photoUrl}
+                alt="Detected vehicle"
+                style={{ width: '100%', maxHeight: 380, objectFit: 'contain', display: 'block' }}
+              />
+            ) : (
+              <span style={{ color: '#8ca0bc', fontSize: 12 }}>No photo available</span>
+            )}
+          </div>
+
+          {/* Details & Plate Crop Row */}
+          <div style={{
+            display: 'grid', gridTemplateColumns: 'auto 1fr', gap: 16,
+            background: '#f8fafd', padding: 14, borderRadius: 12, border: '1px solid #e7ecf4'
+          }}>
+            {/* Plate Crop */}
+            <div style={{
+              background: '#000', padding: 8, borderRadius: 8,
+              border: '2px solid #ca8c06', display: 'flex', flexDirection: 'column',
+              alignItems: 'center', justifyContent: 'center', minWidth: 150
+            }}>
+              <span style={{ fontSize: 9, fontWeight: 800, color: '#ca8c06', textTransform: 'uppercase', marginBottom: 4 }}>
+                Cropped Plate
+              </span>
+              {plateUrl ? (
+                <img
+                  src={plateUrl}
+                  alt={sighting.plate}
+                  style={{ maxHeight: 46, maxWidth: 170, objectFit: 'contain', display: 'block' }}
+                  onError={(e) => { e.target.style.display = 'none'; }}
+                />
+              ) : null}
+              <div style={{
+                marginTop: 6, background: '#fff', color: '#111', fontWeight: 900,
+                fontSize: 14, letterSpacing: 1.5, padding: '3px 10px', borderRadius: 4,
+                border: '1px solid #222'
+              }}>
+                {sighting.plate || 'UNKNOWN'}
+              </div>
+            </div>
+
+            {/* Sighting Metadata */}
+            <div style={{ display: 'grid', gap: 6, fontSize: 12 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid #eef2f7', paddingBottom: 4 }}>
+                <span style={{ color: '#8ca0bc', fontWeight: 600 }}>Detected Time:</span>
+                <b style={{ color: '#172138' }}>{tsDate(sighting.ts)}</b>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid #eef2f7', paddingBottom: 4 }}>
+                <span style={{ color: '#8ca0bc', fontWeight: 600 }}>Camera Stream:</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <b style={{ color: '#172138' }}>{device?.name || sighting.stream}</b>
+                  {device?.role && (
+                    <span className={`badge ${device.role}`} style={{ fontSize: 8 }}>{device.role}</span>
+                  )}
+                </div>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid #eef2f7', paddingBottom: 4 }}>
+                <span style={{ color: '#8ca0bc', fontWeight: 600 }}>Confidence:</span>
+                <div>
+                  {confPct != null ? (
+                    <span className={`badge ${confPct >= 80 ? 'on_site' : confPct >= 50 ? 'warn' : 'err'}`}>
+                      {confPct}% {confPct >= 80 ? 'High Confidence' : 'Moderate'}
+                    </span>
+                  ) : '—'}
+                </div>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', paddingTop: 2 }}>
+                <span style={{ color: '#8ca0bc', fontWeight: 600 }}>Record ID:</span>
+                <span style={{ fontFamily: 'monospace', fontSize: 11, color: '#5d7089' }}>{sighting.id?.slice(0, 16)}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Modal Footer */}
+        <div style={{ display: 'flex', justifyContent: 'flex-end', padding: '12px 20px', borderTop: '1px solid #eef2f7', background: '#fafbfc' }}>
+          <button className="btn primary" onClick={onClose}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ── Camera Slot (Live MJPEG + Fullscreen + Remove) ───────── */
+
+function CameraSlot({
+  slotIndex,
+  stream,
+  devices,
+  activeSlots,
+  onChangeSlot,
+  onRemoveSlot,
+  onFullscreen,
+  canRemove,
+  engineWorkers,
+  videoHeight
+}) {
+  const device = devices.find(d => d.stream === stream);
+  const worker = stream ? engineWorkers?.[stream] : null;
+  const fps = worker?.fps ?? 0;
+  const hasDetections = worker?.plates > 0;
+  const hasError = worker?.error;
+
+  let borderColor = '#2a3a4f';
+  let statusBadge = null;
+  if (!stream) {
+    borderColor = '#2a3a4f';
+  } else if (hasError) {
+    borderColor = '#c04848';
+    statusBadge = <span className="badge err" style={{ fontSize: '9px' }}>ERROR</span>;
+  } else if (hasDetections) {
+    borderColor = '#22a06e';
+    statusBadge = <span className="badge on_site" style={{ fontSize: '9px' }}>{worker.plates} PLATE{worker.plates !== 1 ? 'S' : ''}</span>;
+  } else {
+    borderColor = '#22a06e';
+    statusBadge = <span className="badge on_site" style={{ fontSize: '9px' }}>SCANNING</span>;
+  }
+
+  return (
+    <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+      {/* Slot header */}
+      <div style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        padding: '6px 0', gap: 6, flexWrap: 'wrap'
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+          <span className="badge" style={{ background: 'var(--primary-500)', color: '#fff', fontSize: '9px', padding: '3px 8px', flexShrink: 0 }}>
+            SLOT {slotIndex + 1}
+          </span>
+          {device && (
+            <span style={{ fontSize: 12, fontWeight: 700, color: '#e0e8f0', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+              📹 {device.name}
+            </span>
+          )}
+          {device?.role && (
+            <span className={`badge ${device.role}`} style={{ fontSize: '8px', padding: '2px 6px', flexShrink: 0 }}>
+              {device.role}
+            </span>
+          )}
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+          {stream && (
+            <span style={{ fontSize: 10, color: '#8ca0bc', fontWeight: 600 }}>{fps} FPS</span>
+          )}
+          {statusBadge}
+          {stream && (
+            <button
+              title="Fullscreen"
+              className="btn sm"
+              onClick={() => onFullscreen(stream)}
+              style={{ padding: '3px 7px', background: '#1c293c', color: '#c3d0e0', border: '1px solid #324765', borderRadius: 6 }}
+            >
+              ⛶
+            </button>
+          )}
+          {canRemove && (
+            <button
+              title="Remove this camera from grid view"
+              className="btn sm"
+              onClick={() => onRemoveSlot(slotIndex)}
+              style={{ padding: '3px 7px', background: '#251a24', color: '#e68a8a', border: '1px solid #5a2e3a', borderRadius: 6 }}
+            >
+              ✕
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Video area */}
+      <div style={{
+        position: 'relative',
+        background: 'linear-gradient(180deg, #101a2c, #0b1220)',
+        borderRadius: 10,
+        border: `2px solid ${borderColor}`,
+        overflow: 'hidden',
+        height: videoHeight,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        transition: 'height 0.2s ease-in-out'
+      }}>
+        {stream ? (
+          <img
+            src={`${API}/devices/${stream}/stream.mjpg`}
+            alt={device?.name || stream}
+            style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }}
+            onError={(e) => { e.target.style.display = 'none'; }}
+          />
+        ) : (
+          <div style={{ color: '#5d7089', fontSize: 11, textAlign: 'center', padding: 20 }}>
+            No camera assigned to Slot {slotIndex + 1}<br />
+            <small>Select a camera from the dropdown below</small>
+          </div>
+        )}
+      </div>
+
+      {/* Camera selector dropdown */}
+      <div style={{ marginTop: 6 }}>
+        <select
+          value={stream || ''}
+          onChange={e => onChangeSlot(slotIndex, e.target.value || null)}
+          style={{
+            width: '100%', padding: '7px 10px', border: '1px solid #2a3a4f',
+            borderRadius: 8, background: '#0f1a2c', color: '#c3d0e0',
+            fontSize: 11, fontWeight: 700
+          }}
+        >
+          <option value="">— Select Camera —</option>
+          {devices.map(d => {
+            const inSlot = activeSlots.find((s, idx) => s === d.stream && idx !== slotIndex);
+            return (
+              <option key={d.stream} value={d.stream}>
+                {d.name} {inSlot ? '• In View' : ''}
+              </option>
+            );
+          })}
+        </select>
+      </div>
+    </div>
+  );
+}
+
+/* ── Add Camera Modal ─────────────────────────────────────── */
+
+function AddCameraModal({ open, onClose, onAdd }) {
+  const [url, setUrl] = useState('');
+  const [name, setName] = useState('');
+  const [role, setRole] = useState('checkpoint');
+  const [anpr, setAnpr] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  if (!open) return null;
+
+  const deriveStream = (rawUrl) => {
+    if (!rawUrl || typeof rawUrl !== 'string') return '';
+    const trimmed = rawUrl.trim();
+    if (!trimmed.includes('/') && !trimmed.includes(':')) {
+      return trimmed.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40);
+    }
+    const clean = trimmed.split('?')[0].replace(/\/+$/, '');
+    const parts = clean.split('/');
+    const last = parts[parts.length - 1] || '';
+    const cand = last.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40);
+    if (cand) return cand;
+    return 'cam_' + Math.abs(clean.split('').reduce((a, b) => ((a << 5) - a + b.charCodeAt(0)) | 0, 0)).toString(36);
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!url.trim()) return setError('Camera URL is required');
+    const stream = deriveStream(url.trim());
+    if (!stream) return setError('Please enter a valid Camera URL.');
+    setBusy(true);
+    setError('');
+    try {
+      const result = await api('/devices', { stream, url: url.trim(), name: name.trim() || stream, role, anpr });
+      if (result.error) throw new Error(result.error);
+      onAdd(result);
+      setUrl(''); setName(''); setRole('checkpoint'); setAnpr(true);
+      onClose();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="card modal-box" style={{ width: 460, maxWidth: '92vw' }} onClick={e => e.stopPropagation()}>
+        <div className="head">
+          <h3>Register New Camera</h3>
+          <button className="btn sm" onClick={onClose}>✕</button>
+        </div>
+        <div className="body">
+          {error && <div className="notice err">{error}</div>}
+          <form onSubmit={handleSubmit}>
+            <div className="field" style={{ marginBottom: 12 }}>
+              <span>Camera URL</span>
+              <input placeholder="e.g. rtsp://124.123.89.162:31554/live/mgptz" value={url} onChange={e => setUrl(e.target.value)} />
+              <small style={{ color: '#8ca0bc', fontSize: 10 }}>
+                RTSP, RTMP, or camera stream URL
+              </small>
+            </div>
+            <div className="field" style={{ marginBottom: 12 }}>
+              <span>Display Name</span>
+              <input placeholder="e.g. Main Gate Entry" value={name} onChange={e => setName(e.target.value)} />
+            </div>
+            <div className="form-row" style={{ marginBottom: 12 }}>
+              <div className="field" style={{ flex: 1 }}>
+                <span>Role / Zone</span>
+                <select value={role} onChange={e => setRole(e.target.value)}>
+                  <option value="entry">🟢 Entry Gate</option>
+                  <option value="exit">🔵 Exit Gate</option>
+                  <option value="porch">🟣 Main Porch / Drop-off</option>
+                  <option value="basement">🟠 Basement / Parking Ramp</option>
+                  <option value="emergency">🔴 Emergency Drop-off</option>
+                  <option value="checkpoint">📍 General Checkpoint</option>
+                </select>
+              </div>
+              <label className="check">
+                <input type="checkbox" checked={anpr} onChange={e => setAnpr(e.target.checked)} />
+                ANPR Enabled
+              </label>
+            </div>
+            <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 16 }}>
+              <button type="button" className="btn" onClick={onClose}>Cancel</button>
+              <button type="submit" className="btn primary" disabled={busy}>
+                {busy ? 'Adding…' : '+ Add Camera'}
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ── Edit Camera Modal ────────────────────────────────────── */
+
+function EditCameraModal({ device, open, onClose, onSave, onDelete }) {
+  const [name, setName] = useState(device?.name || '');
+  const [url, setUrl] = useState(device?.url || '');
+  const [role, setRole] = useState(device?.role || 'checkpoint');
+  const [anpr, setAnpr] = useState(device?.anpr ?? true);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (device) {
+      setName(device.name);
+      setUrl(device.url || '');
+      setRole(device.role);
+      setAnpr(device.anpr);
+    }
+  }, [device]);
+
+  if (!open || !device) return null;
+
+  const handleSave = async () => {
+    setBusy(true);
+    try {
+      await api('/devices', { stream: device.stream, url: url.trim(), name, role, anpr });
+      onSave();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!confirm(`Remove camera "${device.name}"?`)) return;
+    setBusy(true);
+    try {
+      await api('/devices/delete', { stream: device.stream });
+      onDelete();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="card modal-box" style={{ width: 440, maxWidth: '92vw' }} onClick={e => e.stopPropagation()}>
+        <div className="head">
+          <h3>Edit Camera — {device.name}</h3>
+          <button className="btn sm" onClick={onClose}>✕</button>
+        </div>
+        <div className="body">
+          <div className="field" style={{ marginBottom: 12 }}>
+            <span>Camera URL</span>
+            <input value={url} onChange={e => setUrl(e.target.value)} placeholder="rtsp://..." />
+          </div>
+          <div className="field" style={{ marginBottom: 12 }}>
+            <span>Display Name</span>
+            <input value={name} onChange={e => setName(e.target.value)} />
+          </div>
+          <div className="form-row" style={{ marginBottom: 12 }}>
+            <div className="field" style={{ flex: 1 }}>
+              <span>Role / Zone</span>
+              <select value={role} onChange={e => setRole(e.target.value)}>
+                <option value="entry">🟢 Entry Gate</option>
+                <option value="exit">🔵 Exit Gate</option>
+                <option value="porch">🟣 Main Porch / Drop-off</option>
+                <option value="basement">🟠 Basement / Parking Ramp</option>
+                <option value="emergency">🔴 Emergency Drop-off</option>
+                <option value="checkpoint">📍 General Checkpoint</option>
+              </select>
+            </div>
+            <label className="check">
+              <input type="checkbox" checked={anpr} onChange={e => setAnpr(e.target.checked)} />
+              ANPR Enabled
+            </label>
+          </div>
+          <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 16 }}>
+            <button className="btn danger" onClick={handleDelete} disabled={busy}>Remove</button>
+            <button className="btn" onClick={onClose}>Cancel</button>
+            <button className="btn primary" onClick={handleSave} disabled={busy}>
+              {busy ? 'Saving…' : 'Save'}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ── Registered Cameras Panel ────────────────────────────── */
+
+function RegisteredCameras({ devices, activeSlots, onToggleViewSlot, onEditCamera, onOpenAdd }) {
+  return (
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+        <b style={{ fontSize: 13, color: '#26334a' }}>Registered Cameras ({devices.length})</b>
+        <button className="btn sm primary" onClick={onOpenAdd}>+ Add</button>
+      </div>
+      <div className="devices">
+        {devices.map(d => {
+          const slotIdx = activeSlots.indexOf(d.stream);
+          const inView = slotIdx !== -1;
+          return (
+            <div key={d.stream} className={`device ${d.anpr ? 'live-dot' : ''}`}>
+              <div className="cam">📹</div>
+              <div className="info">
+                <b>{d.name}</b>
+                <small style={{ fontSize: 9, color: '#8ca0bc', wordBreak: 'break-all' }}>
+                  {d.url || d.stream}
+                </small>
+              </div>
+              <span className={`badge ${d.role}`} style={{ fontSize: 8 }}>{d.role}</span>
+              {inView && (
+                <span className="badge" style={{ background: 'var(--primary-100)', color: 'var(--primary-600)', fontSize: 8 }}>
+                  Slot {slotIdx + 1}
+                </span>
+              )}
+              <button
+                className="btn sm"
+                onClick={() => onToggleViewSlot(d.stream)}
+                style={{
+                  fontSize: 10,
+                  padding: '4px 8px',
+                  background: inView ? '#f0f4f8' : '#e3f6ef',
+                  color: inView ? '#5d7089' : '#17835c',
+                  borderColor: inView ? '#dfe6f0' : '#bfe6d4'
+                }}
+              >
+                {inView ? 'Hide' : 'Show'}
+              </button>
+              <button className="btn sm" onClick={() => onEditCamera(d)}>✏️</button>
+            </div>
+          );
+        })}
+        {devices.length === 0 && <div className="empty">No cameras registered. Click + Add to get started.</div>}
+      </div>
+    </div>
+  );
+}
+
+/* ── Journey Flow (Vehicle Path across Cameras) ──────────── */
+
+function JourneyFlow({ journey, expanded, onToggle, onOpenSightingPhoto }) {
+  if (!journey) return null;
+  const cameras = journey.cameras || [];
+
+  return (
+    <>
+      <tr className="expandable clickable-row" onClick={onToggle}>
+        <td><span className="plate">{journey.plate}</span></td>
+        <td>
+          <span className={`badge ${journey.status}`}>
+            {journey.status === 'on_site' ? '🟢 ON SITE' : '🔵 EXITED'}
+          </span>
+        </td>
+        <td>{journey.entry?.device || '—'}</td>
+        <td style={{ whiteSpace: 'nowrap' }}>{ts(journey.first_at)}</td>
+        <td>{journey.exit?.device || '—'}</td>
+        <td style={{ whiteSpace: 'nowrap' }}>{journey.exit?.at ? ts(journey.exit.at) : '—'}</td>
+        <td><b>{dwell(journey.dwell_ms)}</b></td>
+        <td>
+          <div className="camchips">
+            {cameras.map((c, i) => (
+              <span key={i} className={`camchip ${c.role}`}>{c.name}</span>
+            ))}
+          </div>
+        </td>
+        <td style={{ textAlign: 'center' }}><b>{journey.reads}</b></td>
+      </tr>
+      {expanded && (
+        <tr className="journey-detail">
+          <td colSpan={9} style={{ padding: '12px 16px', background: '#f8fafd' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+              <div style={{ fontSize: 12, fontWeight: 800, color: '#26334a' }}>
+                🚗 Vehicle Travel Timeline & Correlation — <span className="plate">{journey.plate}</span>
+              </div>
+              <span className={`badge ${journey.status}`}>
+                {journey.status === 'on_site' ? '🟢 Currently On Hospital Grounds' : '🔵 Journey Complete / Exited'}
+              </span>
+            </div>
+
+            {/* Travel nodes */}
+            <div className="jt">
+              {cameras.map((cam, i) => (
+                <React.Fragment key={cam.stream + i}>
+                  {i > 0 && <div className="jt-arrow">→</div>}
+                  <div className="jt-node" style={{ '--role-c': roleColor(cam.role) }}>
+                    <div className="role">{cam.role}</div>
+                    <b>{cam.name}</b>
+                    <small>{ts(cam.first)} — {ts(cam.last)}</small>
+                    <div className="reads">
+                      {cam.reads} read{cam.reads !== 1 ? 's' : ''} • conf {Math.round((cam.confidence || 0) * 100)}%
+                    </div>
+                  </div>
+                </React.Fragment>
+              ))}
+            </div>
+
+            {/* Thumbnail captures */}
+            <div className="jt-imgs" style={{ marginTop: 10 }}>
+              {journey.entry?.photo_url && (
+                <figure
+                  className="clickable-thumb"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onOpenSightingPhoto({
+                      photo_url: journey.entry.photo_url,
+                      plate: journey.plate,
+                      stream: journey.entry.stream || journey.entry.device,
+                      ts: journey.first_at,
+                      confidence: journey.entry.confidence
+                    });
+                  }}
+                  title="Click to view full image"
+                  style={{ cursor: 'pointer' }}
+                >
+                  <img src={`${API}${journey.entry.photo_url}`} alt="Entry Sighting" />
+                  <figcaption>🔍 Entry: {journey.entry.device} ({ts(journey.first_at)})</figcaption>
+                </figure>
+              )}
+              {journey.exit?.photo_url && (
+                <figure
+                  className="clickable-thumb"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onOpenSightingPhoto({
+                      photo_url: journey.exit.photo_url,
+                      plate: journey.plate,
+                      stream: journey.exit.stream || journey.exit.device,
+                      ts: journey.exit.at,
+                      confidence: journey.exit.confidence
+                    });
+                  }}
+                  title="Click to view full image"
+                  style={{ cursor: 'pointer' }}
+                >
+                  <img src={`${API}${journey.exit.photo_url}`} alt="Exit Sighting" />
+                  <figcaption>🔍 Exit: {journey.exit.device} ({ts(journey.exit.at)})</figcaption>
+                </figure>
+              )}
+            </div>
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+/* ── Dynamic Device Zone Classification Helper ──────────────── */
+
+function getDeviceZone(device) {
+  const name = (device?.name || '').toLowerCase();
+  const role = (device?.role || '').toLowerCase();
+  if (role === 'entry') return { key: 'entry', label: 'Entry Gate', icon: '🟢', badgeBg: '#dcfce7', badgeColor: '#15803d', barColor: '#16a34a' };
+  if (role === 'exit') return { key: 'exit', label: 'Exit Gate', icon: '🔵', badgeBg: '#dbeafe', badgeColor: '#1d4ed8', barColor: '#2563eb' };
+  if (role === 'porch' || name.includes('porch') || name.includes('drop-off')) {
+    return { key: 'porch', label: 'Porch', icon: '🟣', badgeBg: '#f3e8ff', badgeColor: '#7e22ce', barColor: '#9333ea' };
+  }
+  if (role === 'basement' || name.includes('basement') || name.includes('ramp')) {
+    return { key: 'basement', label: 'Basement', icon: '🟠', badgeBg: '#ffedd5', badgeColor: '#c2410c', barColor: '#ea580c' };
+  }
+  if (role === 'parking' || name.includes('parking')) {
+    return { key: 'parking', label: 'Parking', icon: '🅿️', badgeBg: '#e0f2fe', badgeColor: '#0369a1', barColor: '#0284c7' };
+  }
+  if (role === 'emergency' || name.includes('emergency') || name.includes('ambulance')) {
+    return { key: 'emergency', label: 'Emergency', icon: '🔴', badgeBg: '#fee2e2', badgeColor: '#b91c1c', barColor: '#dc2626' };
+  }
+  return { key: 'checkpoint', label: 'Internal', icon: '📍', badgeBg: '#f1f5f9', badgeColor: '#475569', barColor: '#6366f1' };
+}
+
+/* ── Gate Traffic & Camera Flow Analysis ──────────────────── */
+
+function GateAnalyticsCard({ analytics, devices, timeFilter, setTimeFilter }) {
+  const [timelineMode, setTimelineMode] = useState('hourly'); // 'hourly' | 'daily'
+  const [timelineOffset, setTimelineOffset] = useState(0); // 0 = latest hours
+  const perCamera = analytics?.per_camera || {};
+
+  const entryDevices = (devices || []).filter(d => d.role === 'entry');
+  const exitDevices = (devices || []).filter(d => d.role === 'exit');
+  // All internal devices: Porch, Basement, Parking, Checkpoint, Drop-off, etc.
+  const internalDevices = (devices || []).filter(d => d.role !== 'entry' && d.role !== 'exit');
+
+  const totalEntries = entryDevices.reduce((sum, d) => sum + (perCamera[d.stream] || 0), 0) || (analytics?.vehicles_today || 0);
+  const cameraExits = exitDevices.reduce((sum, d) => sum + (perCamera[d.stream] || 0), 0);
+  const onSiteCount = analytics?.on_site ?? 0;
+  const totalExited = analytics?.exited ?? (totalEntries > onSiteCount ? totalEntries - onSiteCount : cameraExits);
+  const inferredExits = Math.max(0, totalExited - cameraExits);
+  const totalInternal = internalDevices.reduce((sum, d) => sum + (perCamera[d.stream] || 0), 0);
+  const clearanceRate = totalEntries > 0 ? Math.round((totalExited / totalEntries) * 100) : 0;
+
+  // Hourly timeline
+  const hourly = analytics?.hourly_entries || [];
+
+  // Daily timeline aggregation
+  const dailyEntries = useMemo(() => {
+    const map = {};
+    (analytics?.hourly_entries || []).forEach(h => {
+      const d = new Date(h.bucket);
+      const dayLabel = d.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short' });
+      map[dayLabel] = (map[dayLabel] || 0) + h.count;
+    });
+    return Object.entries(map).map(([dayLabel, count]) => ({ dayLabel, count }));
+  }, [analytics?.hourly_entries]);
+
+  // Determine active timeline data based on mode or active filter
+  const isDaily = timelineMode === 'daily' || timeFilter === '7d';
+  const timelineItems = isDaily ? dailyEntries : hourly;
+
+  // Pagination for timeline: 5 items per view window with ◀ Earlier and Later ▶ controls
+  const WINDOW_SIZE = 5;
+  const totalItems = timelineItems.length;
+  const clampedOffset = Math.min(Math.max(0, timelineOffset), Math.max(0, totalItems - WINDOW_SIZE));
+  const endIndex = Math.max(0, totalItems - clampedOffset);
+  const startIndex = Math.max(0, endIndex - WINDOW_SIZE);
+  const visibleItems = timelineItems.slice(startIndex, endIndex);
+
+  const canGoEarlier = startIndex > 0;
+  const canGoLater = clampedOffset > 0;
+
+  const maxPeak = Math.max(...visibleItems.map(item => item.count), 1);
+
+  // Reset offset when mode or filter changes
+  useEffect(() => {
+    setTimelineOffset(0);
+  }, [timeFilter, timelineMode]);
+
+  return (
+    <div className="card" style={{ marginBottom: 16 }}>
+      {/* Head */}
+      <div className="head" style={{ padding: '14px 18px', flexWrap: 'wrap', gap: 10 }}>
+        <div>
+          <h3 style={{ margin: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span>📊</span> Gate Traffic & Camera Flow Analysis
+          </h3>
+          <small style={{ color: '#8ca0bc', marginTop: 2, display: 'block' }}>
+            Real-time vehicle passage volume across entry gates, internal zones, and exit checkpoints
+          </small>
+        </div>
+
+        {/* Quick Time Range Presets */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+          {[
+            { key: '1h', label: '1h' },
+            { key: '6h', label: '6h' },
+            { key: 'today', label: 'Today' },
+            { key: '24h', label: '24h' },
+            { key: '7d', label: '7 Days' },
+          ].map(btn => (
+            <button
+              key={btn.key}
+              onClick={() => setTimeFilter && setTimeFilter(btn.key)}
+              style={{
+                padding: '4px 10px',
+                fontSize: 11,
+                fontWeight: 700,
+                borderRadius: 6,
+                border: timeFilter === btn.key ? '1px solid #0369a1' : '1px solid #cbd5e1',
+                background: timeFilter === btn.key ? '#0284c7' : '#fff',
+                color: timeFilter === btn.key ? '#fff' : '#475569',
+                cursor: 'pointer'
+              }}
+            >
+              {btn.label}
+            </button>
+          ))}
+          <span className="badge" style={{ background: '#e0f2fe', color: '#0369a1', fontWeight: 700, fontSize: 11 }}>
+            ⚡ Low-Latency GPU Telemetry
+          </span>
+        </div>
+      </div>
+
+      <div className="body" style={{ padding: '18px' }}>
+        {/* KPI Mini Summary Tiles */}
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: 14, marginBottom: 20 }}>
+          <div style={{ background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 10, padding: '12px 16px' }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: '#166534', textTransform: 'uppercase', marginBottom: 4 }}>
+              🟢 Inflow (Entry Gates)
+            </div>
+            <div style={{ fontSize: 24, fontWeight: 900, color: '#14532d' }}>
+              {totalEntries.toLocaleString()}
+            </div>
+            <div style={{ fontSize: 11, color: '#15803d', marginTop: 2 }}>
+              Vehicles entered campus
+            </div>
+          </div>
+
+          <div style={{ background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 10, padding: '12px 16px' }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: '#1e40af', textTransform: 'uppercase', marginBottom: 4 }}>
+              🔵 Total Departed
+            </div>
+            <div style={{ fontSize: 24, fontWeight: 900, color: '#1e3a8a' }}>
+              {totalExited.toLocaleString()}
+            </div>
+            <div style={{ fontSize: 11, color: '#2563eb', marginTop: 2 }}>
+              {cameraExits} camera verified • {inferredExits} grace timeout
+            </div>
+          </div>
+
+          <div style={{ background: '#fefce8', border: '1px solid #fef08a', borderRadius: 10, padding: '12px 16px' }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: '#854d0e', textTransform: 'uppercase', marginBottom: 4 }}>
+              🟡 Currently Inside
+            </div>
+            <div style={{ fontSize: 24, fontWeight: 900, color: '#713f12' }}>
+              {onSiteCount.toLocaleString()}
+            </div>
+            <div style={{ fontSize: 11, color: '#a16207', marginTop: 2 }}>
+              Active on campus (seen &lt; 45m)
+            </div>
+          </div>
+
+          <div style={{ background: '#faf5ff', border: '1px solid #e9d5ff', borderRadius: 10, padding: '12px 16px' }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: '#6b21a8', textTransform: 'uppercase', marginBottom: 4 }}>
+              ⏱ Clearance Rate
+            </div>
+            <div style={{ fontSize: 24, fontWeight: 900, color: '#581c87' }}>
+              {clearanceRate}%
+            </div>
+            <div style={{ fontSize: 11, color: '#7e22ce', marginTop: 2 }}>
+              Exited vs entered ratio
+            </div>
+          </div>
+        </div>
+
+        {/* Gate Breakdown Columns: Entry vs Checkpoints/Internal Zones vs Exit */}
+        <div style={{ display: 'grid', gridTemplateColumns: `repeat(auto-fit, minmax(${internalDevices.length > 0 ? '240px' : '280px'}, 1fr))`, gap: 18 }}>
+          {/* Entry Gates Column */}
+          <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 10, padding: '16px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span style={{ fontSize: 14 }}>🟢</span>
+                <span style={{ fontWeight: 800, fontSize: 13, color: '#0f172a' }}>Entry Checkpoints</span>
+              </div>
+              <span className="badge" style={{ background: '#dcfce7', color: '#15803d', fontWeight: 700, fontSize: 11 }}>
+                {totalEntries.toLocaleString()} Total
+              </span>
+            </div>
+
+            <div style={{ display: 'grid', gap: 12 }}>
+              {entryDevices.map(d => {
+                const count = perCamera[d.stream] || 0;
+                const pct = totalEntries > 0 ? Math.round((count / totalEntries) * 100) : 0;
+                return (
+                  <div key={d.stream} style={{ background: '#f8fafc', padding: '10px 14px', borderRadius: 8, border: '1px solid #f1f5f9' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                      <span style={{ fontWeight: 700, fontSize: 12, color: '#1e293b' }}>{d.name}</span>
+                      <span style={{ fontSize: 12, fontWeight: 800, color: '#0f172a' }}>
+                        {count.toLocaleString()} <span style={{ fontSize: 11, color: '#64748b', fontWeight: 600 }}>({pct}%)</span>
+                      </span>
+                    </div>
+                    <div style={{ height: 7, background: '#e2e8f0', borderRadius: 4, overflow: 'hidden' }}>
+                      <div style={{ width: `${pct}%`, height: '100%', background: '#16a34a', borderRadius: 4, transition: 'width 0.4s ease' }} />
+                    </div>
+                  </div>
+                );
+              })}
+              {entryDevices.length === 0 && (
+                <div style={{ color: '#94a3b8', fontSize: 12, textAlign: 'center', padding: 12 }}>No entry cameras registered</div>
+              )}
+            </div>
+          </div>
+
+          {/* Internal Zones & Checkpoints Column (Dynamically surfaces and handles Porch, Basement, Parking, etc.) */}
+          {internalDevices.length > 0 && (
+            <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 10, padding: '16px' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <span style={{ fontSize: 14 }}>🏢</span>
+                  <span style={{ fontWeight: 800, fontSize: 13, color: '#0f172a' }}>Internal Zones & Checkpoints</span>
+                </div>
+                <span className="badge" style={{ background: '#f3e8ff', color: '#7e22ce', fontWeight: 700, fontSize: 11 }}>
+                  {totalInternal.toLocaleString()} Total
+                </span>
+              </div>
+
+              <div style={{ display: 'grid', gap: 12 }}>
+                {internalDevices.map(d => {
+                  const zone = getDeviceZone(d);
+                  const count = perCamera[d.stream] || 0;
+                  const pct = totalEntries > 0 ? Math.round((count / totalEntries) * 100) : 0;
+                  return (
+                    <div key={d.stream} style={{ background: '#f8fafc', padding: '10px 14px', borderRadius: 8, border: '1px solid #f1f5f9' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <span style={{ fontSize: 9, fontWeight: 800, background: zone.badgeBg, color: zone.badgeColor, padding: '2px 6px', borderRadius: 4, textTransform: 'uppercase' }}>
+                            {zone.icon} {zone.label}
+                          </span>
+                          <span style={{ fontWeight: 700, fontSize: 12, color: '#1e293b' }}>{d.name}</span>
+                        </div>
+                        <span style={{ fontSize: 12, fontWeight: 800, color: '#0f172a' }}>
+                          {count.toLocaleString()} <span style={{ fontSize: 11, color: '#64748b', fontWeight: 600 }}>({pct}% of entries)</span>
+                        </span>
+                      </div>
+                      <div style={{ height: 7, background: '#e2e8f0', borderRadius: 4, overflow: 'hidden' }}>
+                        <div style={{ width: `${Math.min(100, pct)}%`, height: '100%', background: zone.barColor, borderRadius: 4, transition: 'width 0.4s ease' }} />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Exit Gates Column */}
+          <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 10, padding: '16px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span style={{ fontSize: 14 }}>🔵</span>
+                <span style={{ fontWeight: 800, fontSize: 13, color: '#0f172a' }}>Exit Checkpoints</span>
+              </div>
+              <span className="badge" style={{ background: '#dbeafe', color: '#1d4ed8', fontWeight: 700, fontSize: 11 }}>
+                {cameraExits.toLocaleString()} Camera Verified
+              </span>
+            </div>
+
+            <div style={{ display: 'grid', gap: 12 }}>
+              {exitDevices.map(d => {
+                const count = perCamera[d.stream] || 0;
+                const pct = cameraExits > 0 ? Math.round((count / cameraExits) * 100) : 0;
+                return (
+                  <div key={d.stream} style={{ background: '#f8fafc', padding: '10px 14px', borderRadius: 8, border: '1px solid #f1f5f9' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                      <span style={{ fontWeight: 700, fontSize: 12, color: '#1e293b' }}>{d.name}</span>
+                      <span style={{ fontSize: 12, fontWeight: 800, color: '#0f172a' }}>
+                        {count.toLocaleString()} <span style={{ fontSize: 11, color: '#64748b', fontWeight: 600 }}>({pct}%)</span>
+                      </span>
+                    </div>
+                    <div style={{ height: 7, background: '#e2e8f0', borderRadius: 4, overflow: 'hidden' }}>
+                      <div style={{ width: `${pct}%`, height: '100%', background: '#2563eb', borderRadius: 4, transition: 'width 0.4s ease' }} />
+                    </div>
+                  </div>
+                );
+              })}
+              {exitDevices.length === 0 && (
+                <div style={{ color: '#94a3b8', fontSize: 12, textAlign: 'center', padding: 12 }}>No exit cameras registered</div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Hourly vs Daily Traffic Volume Timeline with Scroll / Shift Navigation */}
+        {((isDaily && dailyEntries.length > 0) || (!isDaily && hourly.length > 0)) && (
+          <div style={{ marginTop: 18, background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 10, padding: '14px 16px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14, flexWrap: 'wrap', gap: 10 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                <span style={{ fontWeight: 700, fontSize: 12, color: '#334155' }}>
+                  📈 {isDaily ? 'Daily Traffic Volume' : 'Inflow Volume Timeline (Hourly Traffic Pulse)'}
+                </span>
+                {/* Granularity Switcher: Hourly vs Daily */}
+                <div style={{ display: 'inline-flex', background: '#e2e8f0', borderRadius: 6, padding: 2 }}>
+                  <button
+                    type="button"
+                    onClick={() => { setTimelineMode('hourly'); setTimelineOffset(0); }}
+                    style={{
+                      padding: '3px 8px', fontSize: 10, fontWeight: 700, border: 'none', borderRadius: 5,
+                      background: !isDaily ? '#fff' : 'transparent',
+                      color: !isDaily ? '#0f172a' : '#64748b', cursor: 'pointer',
+                      boxShadow: !isDaily ? '0 1px 3px rgba(0,0,0,0.1)' : 'none'
+                    }}
+                  >
+                    ⏱ Hourly
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => { setTimelineMode('daily'); setTimelineOffset(0); }}
+                    style={{
+                      padding: '3px 8px', fontSize: 10, fontWeight: 700, border: 'none', borderRadius: 5,
+                      background: isDaily ? '#fff' : 'transparent',
+                      color: isDaily ? '#0f172a' : '#64748b', cursor: 'pointer',
+                      boxShadow: isDaily ? '0 1px 3px rgba(0,0,0,0.1)' : 'none'
+                    }}
+                  >
+                    📅 Daily
+                  </button>
+                </div>
+              </div>
+
+              {/* Left / Right Navigation Controls */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <button
+                  type="button"
+                  onClick={() => setTimelineOffset(prev => Math.min(Math.max(0, totalItems - WINDOW_SIZE), prev + WINDOW_SIZE))}
+                  disabled={!canGoEarlier}
+                  style={{
+                    padding: '4px 10px',
+                    fontSize: 11,
+                    fontWeight: 700,
+                    borderRadius: 6,
+                    border: '1px solid #cbd5e1',
+                    background: canGoEarlier ? '#fff' : '#f1f5f9',
+                    color: canGoEarlier ? '#1e293b' : '#94a3b8',
+                    cursor: canGoEarlier ? 'pointer' : 'not-allowed',
+                    display: 'flex', alignItems: 'center', gap: 4,
+                    boxShadow: canGoEarlier ? '0 1px 2px rgba(0,0,0,0.05)' : 'none'
+                  }}
+                  title="View previous hours / earlier data"
+                >
+                  ◀ Earlier
+                </button>
+
+                <span style={{ fontSize: 11, color: '#475569', fontWeight: 700, minWidth: 90, textAlign: 'center' }}>
+                  {totalItems > 0 ? (
+                    `${startIndex + 1}–${endIndex} of ${totalItems} ${isDaily ? 'days' : 'hrs'}`
+                  ) : '0 data'}
+                </span>
+
+                <button
+                  type="button"
+                  onClick={() => setTimelineOffset(prev => Math.max(0, prev - WINDOW_SIZE))}
+                  disabled={!canGoLater}
+                  style={{
+                    padding: '4px 10px',
+                    fontSize: 11,
+                    fontWeight: 700,
+                    borderRadius: 6,
+                    border: '1px solid #cbd5e1',
+                    background: canGoLater ? '#fff' : '#f1f5f9',
+                    color: canGoLater ? '#1e293b' : '#94a3b8',
+                    cursor: canGoLater ? 'pointer' : 'not-allowed',
+                    display: 'flex', alignItems: 'center', gap: 4,
+                    boxShadow: canGoLater ? '0 1px 2px rgba(0,0,0,0.05)' : 'none'
+                  }}
+                  title="View later hours / more recent data"
+                >
+                  Later ▶
+                </button>
+
+                <span style={{ fontSize: 11, color: '#64748b', marginLeft: 6 }}>
+                  Peak: <b>{maxPeak}</b> vehicles {isDaily ? '/day' : '/hr'}
+                </span>
+              </div>
+            </div>
+
+            {/* Timeline Bars */}
+            <div style={{ display: 'flex', alignItems: 'flex-end', gap: 10, height: 75, paddingTop: 10, overflowX: 'auto' }}>
+              {isDaily ? (
+                visibleItems.map(d => {
+                  const heightPct = Math.max(12, Math.round((d.count / maxPeak) * 100));
+                  return (
+                    <div key={d.dayLabel} style={{ flex: 1, minWidth: 60, display: 'flex', flexDirection: 'column', alignItems: 'center', height: '100%' }}>
+                      <span style={{ fontSize: 10, fontWeight: 700, color: '#475569', marginBottom: 4 }}>
+                        {d.count}
+                      </span>
+                      <div style={{ flex: 1, width: '100%', display: 'flex', alignItems: 'flex-end', background: '#e2e8f0', borderRadius: '4px 4px 0 0' }}>
+                        <div
+                          style={{
+                            width: '100%',
+                            height: `${heightPct}%`,
+                            background: 'linear-gradient(180deg, #3b82f6 0%, #1d4ed8 100%)',
+                            borderRadius: '4px 4px 0 0',
+                            transition: 'height 0.4s ease'
+                          }}
+                          title={`${d.dayLabel}: ${d.count} vehicles`}
+                        />
+                      </div>
+                      <span style={{ fontSize: 9, color: '#64748b', marginTop: 4, whiteSpace: 'nowrap' }}>
+                        {d.dayLabel}
+                      </span>
+                    </div>
+                  );
+                })
+              ) : (
+                visibleItems.map(h => {
+                  const heightPct = Math.max(12, Math.round((h.count / maxPeak) * 100));
+                  const dateObj = new Date(h.bucket);
+                  const hourLabel = dateObj.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: 'numeric', hour12: true });
+                  return (
+                    <div key={h.bucket} style={{ flex: 1, minWidth: 60, display: 'flex', flexDirection: 'column', alignItems: 'center', height: '100%' }}>
+                      <span style={{ fontSize: 10, fontWeight: 700, color: '#475569', marginBottom: 4 }}>
+                        {h.count}
+                      </span>
+                      <div style={{ flex: 1, width: '100%', display: 'flex', alignItems: 'flex-end', background: '#e2e8f0', borderRadius: '4px 4px 0 0' }}>
+                        <div
+                          style={{
+                            width: '100%',
+                            height: `${heightPct}%`,
+                            background: 'linear-gradient(180deg, #10b981 0%, #059669 100%)',
+                            borderRadius: '4px 4px 0 0',
+                            transition: 'height 0.4s ease'
+                          }}
+                          title={`${hourLabel}: ${h.count} vehicles`}
+                        />
+                      </div>
+                      <span style={{ fontSize: 9, color: '#64748b', marginTop: 4, whiteSpace: 'nowrap' }}>
+                        {hourLabel}
+                      </span>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ── Journey Rules Panel ──────────────────────────────────── */
+
+function RulesPanel({ rules, onUpdate }) {
+  const [visitGap, setVisitGap] = useState(rules?.visit_gap_min ?? 30);
+  const [exitGrace, setExitGrace] = useState(rules?.exit_grace_min ?? 45);
+  const [correlateWindow, setCorrelateWindow] = useState(rules?.correlate_window_s ?? 300);
+  const [correlatePassages, setCorrelatePassages] = useState(rules?.correlate_passages ?? true);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (rules) {
+      setVisitGap(rules.visit_gap_min);
+      setExitGrace(rules.exit_grace_min);
+      setCorrelateWindow(rules.correlate_window_s);
+      setCorrelatePassages(rules.correlate_passages);
+    }
+  }, [rules]);
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      await api('/rules', {
+        visit_gap_min: visitGap,
+        exit_grace_min: exitGrace,
+        correlate_window_s: correlateWindow,
+        correlate_passages: correlatePassages
+      });
+      onUpdate();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div>
+      <div className="field" style={{ marginBottom: 14 }}>
+        <span>Visit Gap (minutes)</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <input type="range" min={1} max={120} value={visitGap} onChange={e => setVisitGap(Number(e.target.value))} style={{ flex: 1 }} />
+          <b style={{ fontSize: 12, minWidth: 30 }}>{visitGap}m</b>
+        </div>
+        <small style={{ color: '#8ca0bc', fontSize: 10 }}>Minutes of silence before a new visit starts for the same plate</small>
+      </div>
+      <div className="field" style={{ marginBottom: 14 }}>
+        <span>Exit Grace (minutes)</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <input type="range" min={1} max={120} value={exitGrace} onChange={e => setExitGrace(Number(e.target.value))} style={{ flex: 1 }} />
+          <b style={{ fontSize: 12, minWidth: 30 }}>{exitGrace}m</b>
+        </div>
+        <small style={{ color: '#8ca0bc', fontSize: 10 }}>Minutes after last sighting to consider vehicle exited</small>
+      </div>
+      <div className="field" style={{ marginBottom: 14 }}>
+        <span>Correlate Window (seconds)</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <input type="range" min={30} max={3600} step={30} value={correlateWindow} onChange={e => setCorrelateWindow(Number(e.target.value))} style={{ flex: 1 }} />
+          <b style={{ fontSize: 12, minWidth: 40 }}>{correlateWindow}s</b>
+        </div>
+      </div>
+      <label className="check">
+        <input type="checkbox" checked={correlatePassages} onChange={e => setCorrelatePassages(e.target.checked)} />
+        Correlate Passages
+      </label>
+      <button className="btn primary" style={{ width: '100%', marginTop: 8 }} onClick={save} disabled={busy}>
+        {busy ? 'Updating…' : 'Update Journey Rules'}
+      </button>
+    </div>
+  );
+}
+
+/* ── Excel Export Helper ──────────────────────────────────── */
+
+function exportJourneysToExcel({ journeys, apiOrigin }) {
+  const wb = XLSX.utils.book_new();
+
+  // Clean table headers starting directly on Row 1 — NO metadata or summary lines!
+  const tableHeaders = [
+    'S.No',
+    'License Plate',
+    'Status',
+    'Entry Camera',
+    'Entry Date & Time',
+    'Exit Camera',
+    'Exit Date & Time',
+    'Dwell Duration',
+    'Cameras Visited',
+    'Total Reads',
+    'Entry Vehicle Photo',
+    'Exit Vehicle Photo',
+  ];
+
+  const dataRows = journeys.map((j, idx) => {
+    const entryTime = j.first_at ? new Date(j.first_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) : '—';
+    const exitTime = j.exit?.at ? new Date(j.exit.at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) : '—';
+    const path = (j.cameras || []).map(c => c.name).join(' → ') || j.entry?.device || '—';
+    const entryPhotoUrl = j.entry?.photo_url ? `${apiOrigin}${j.entry.photo_url}` : null;
+    const exitPhotoUrl = j.exit?.photo_url ? `${apiOrigin}${j.exit.photo_url}` : null;
+
+    return [
+      idx + 1,
+      j.plate,
+      j.status === 'on_site' ? 'ON SITE' : 'EXITED',
+      j.entry?.device || '—',
+      entryTime,
+      j.exit?.device || '—',
+      exitTime,
+      dwell(j.dwell_ms),
+      path,
+      j.reads || 1,
+      entryPhotoUrl ? { t: 's', v: 'View Entry Photo', l: { Target: entryPhotoUrl, Tooltip: 'Click to open vehicle & plate photo in browser' } } : '—',
+      exitPhotoUrl ? { t: 's', v: 'View Exit Photo', l: { Target: exitPhotoUrl, Tooltip: 'Click to open vehicle & plate photo in browser' } } : '—',
+    ];
+  });
+
+  const ws = XLSX.utils.aoa_to_sheet([tableHeaders, ...dataRows]);
+
+  ws['!cols'] = [
+    { wch: 6 },  // S.No
+    { wch: 16 }, // License Plate
+    { wch: 12 }, // Status
+    { wch: 26 }, // Entry Camera
+    { wch: 22 }, // Entry Date & Time
+    { wch: 26 }, // Exit Camera
+    { wch: 22 }, // Exit Date & Time
+    { wch: 16 }, // Dwell Duration
+    { wch: 36 }, // Cameras Visited
+    { wch: 12 }, // Total Reads
+    { wch: 20 }, // Entry Vehicle Photo
+    { wch: 20 }, // Exit Vehicle Photo
+  ];
+
+  XLSX.utils.book_append_sheet(wb, ws, 'Vehicle Journeys');
+
+  const d = new Date();
+  const dateStr = d.toISOString().slice(0, 10);
+  const timeStr = `${String(d.getHours()).padStart(2, '0')}-${String(d.getMinutes()).padStart(2, '0')}`;
+  const filename = `Vehicle_Journeys_${dateStr}_${timeStr}.xlsx`;
+
+  XLSX.writeFile(wb, filename);
+}
+
+
+/* ── Main App ─────────────────────────────────────────────── */
+
+function App() {
+  const [clockTime, setClockTime] = useState(() => {
+    return new Date().toLocaleTimeString('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true
+    }).toUpperCase() + ' IST';
+  });
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setClockTime(new Date().toLocaleTimeString('en-IN', {
+        timeZone: 'Asia/Kolkata',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: true
+      }).toUpperCase() + ' IST');
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const [state, setState] = useState(null);
+  const [analytics, setAnalytics] = useState(null);
+  const [journeyData, setJourneyData] = useState([]);
+  const [expandedJourney, setExpandedJourney] = useState(null);
+  const [addOpen, setAddOpen] = useState(false);
+  const [editDevice, setEditDevice] = useState(null);
+  const [searchPlate, setSearchPlate] = useState('');
+  const [timeFilter, setTimeFilter] = useState('1h'); // '15m' | '30m' | '1h' | '2h' | '6h' | '12h' | '24h' | 'today' | 'custom'
+  const [customStart, setCustomStart] = useState(() => {
+    const d = new Date();
+    d.setHours(d.getHours() - 1);
+    return d.toISOString().slice(0, 16);
+  });
+  const [customEnd, setCustomEnd] = useState(() => {
+    return new Date().toISOString().slice(0, 16);
+  });
+  const [selectedCameraFilter, setSelectedCameraFilter] = useState('all');
+  const [selectedStatusFilter, setSelectedStatusFilter] = useState('all');
+  const [pageSize, setPageSize] = useState(25);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [exportNotice, setExportNotice] = useState(null);
+  const [isExporting, setIsExporting] = useState(false);
+  const [error, setError] = useState(null);
+
+  // Dynamic View Grid slots (array of stream IDs e.g. ['mgptz', 'exit_gate'])
+  const [activeSlots, setActiveSlots] = useState(() => {
+    try {
+      const saved = localStorage.getItem('vehicle_tracker_view_slots');
+      if (saved) return JSON.parse(saved);
+    } catch {}
+    return ['mgptz', 'mg_outside', 'exit_gate', 'egtmp'];
+  });
+
+
+  // Modals
+  const [fullscreenStream, setFullscreenStream] = useState(null);
+  const [selectedSightingModal, setSelectedSightingModal] = useState(null);
+
+  const devices = state?.devices || [];
+  const rules = state?.rules;
+  const engine = state?.engine;
+
+  const deviceMap = useMemo(() => {
+    const m = {};
+    (devices || []).forEach(d => { m[d.stream] = d; });
+    return m;
+  }, [devices]);
+
+  // Save viewSlots to localStorage
+  const updateActiveSlots = useCallback((newSlots) => {
+    setActiveSlots(newSlots);
+    try {
+      localStorage.setItem('vehicle_tracker_view_slots', JSON.stringify(newSlots));
+    } catch {}
+  }, []);
+
+  // Presets
+  const setPreset = useCallback((preset) => {
+    if (preset === '1-focus') {
+      updateActiveSlots(['mgptz']);
+    } else if (preset === 'entry-exit') {
+      updateActiveSlots(['mgptz', 'exit_gate']);
+    } else if (preset === 'entry-pair') {
+      updateActiveSlots(['mgptz', 'mg_outside']);
+    } else if (preset === 'exit-pair') {
+      updateActiveSlots(['exit_gate', 'egtmp']);
+    } else if (preset === 'all-4') {
+      updateActiveSlots(['mgptz', 'mg_outside', 'exit_gate', 'egtmp']);
+    }
+  }, [updateActiveSlots]);
+
+  const handleSlotChange = useCallback((slotIndex, stream) => {
+    const next = [...activeSlots];
+    if (stream) {
+      next[slotIndex] = stream;
+    } else {
+      next[slotIndex] = null;
+    }
+    updateActiveSlots(next);
+  }, [activeSlots, updateActiveSlots]);
+
+  const handleRemoveSlot = useCallback((slotIndex) => {
+    if (activeSlots.length <= 1) return;
+    const next = activeSlots.filter((_, idx) => idx !== slotIndex);
+    updateActiveSlots(next);
+  }, [activeSlots, updateActiveSlots]);
+
+  const handleAddSlot = useCallback(() => {
+    // Pick the first registered camera that is not yet visible in activeSlots
+    const inUse = new Set(activeSlots.filter(Boolean));
+    const nextAvailable = devices.find(d => !inUse.has(d.stream));
+    const toAdd = nextAvailable ? nextAvailable.stream : (devices[0]?.stream || null);
+    updateActiveSlots([...activeSlots, toAdd]);
+  }, [activeSlots, devices, updateActiveSlots]);
+
+  const handleToggleViewSlot = useCallback((stream) => {
+    if (activeSlots.includes(stream)) {
+      if (activeSlots.length > 1) {
+        updateActiveSlots(activeSlots.filter(s => s !== stream));
+      }
+    } else {
+      updateActiveSlots([...activeSlots, stream]);
+    }
+  }, [activeSlots, updateActiveSlots]);
+
+  // Data fetching
+  const loadState = useCallback(async () => {
+    try {
+      let queryHours = 24;
+      if (timeFilter === '15m' || timeFilter === '30m' || timeFilter === '1h') queryHours = 2;
+      else if (timeFilter === '2h') queryHours = 4;
+      else if (timeFilter === '6h') queryHours = 8;
+      else if (timeFilter === '12h') queryHours = 16;
+      else if (timeFilter === '24h' || timeFilter === 'today') queryHours = 24;
+      else if (timeFilter === '7d') queryHours = 168;
+      else if (timeFilter === 'custom') {
+        const diffMs = Math.max(0, Date.now() - new Date(customStart).getTime());
+        queryHours = Math.min(720, Math.max(1, Math.ceil(diffMs / 3600000)));
+      }
+      const [stateData, analyticsData, journeyRes] = await Promise.all([
+        api('/state'),
+        api('/analytics?hours=' + queryHours),
+        api('/journeys?hours=' + queryHours + (searchPlate ? '&plate=' + searchPlate : ''))
+      ]);
+      setState(stateData);
+      setAnalytics(analyticsData);
+      setJourneyData(journeyRes.journeys || []);
+      setError(null);
+    } catch (err) {
+      setError(err.message);
+    }
+  }, [timeFilter, customStart, searchPlate]);
+
+  useEffect(() => {
+    loadState();
+    const iv = setInterval(loadState, POLL_INTERVAL);
+    return () => clearInterval(iv);
+  }, [loadState]);
+
+  // Filter journeys in real-time in front of the user
+  const filteredJourneys = useMemo(() => {
+    const now = Date.now();
+    let minTs = 0;
+    let maxTs = Infinity;
+
+    if (timeFilter === '15m') minTs = now - 15 * 60 * 1000;
+    else if (timeFilter === '30m') minTs = now - 30 * 60 * 1000;
+    else if (timeFilter === '1h') minTs = now - 60 * 60 * 1000;
+    else if (timeFilter === '2h') minTs = now - 2 * 60 * 60 * 1000;
+    else if (timeFilter === '6h') minTs = now - 6 * 60 * 60 * 1000;
+    else if (timeFilter === '12h') minTs = now - 12 * 60 * 60 * 1000;
+    else if (timeFilter === '24h') minTs = now - 24 * 60 * 60 * 1000;
+    else if (timeFilter === '7d') minTs = now - 7 * 24 * 60 * 60 * 1000;
+    else if (timeFilter === 'today') {
+      const istDateStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }); // YYYY-MM-DD in IST
+      minTs = new Date(`${istDateStr}T00:00:00+05:30`).getTime();
+    } else if (timeFilter === 'custom') {
+      minTs = new Date(customStart).getTime() || 0;
+      maxTs = new Date(customEnd).getTime() || Infinity;
+    }
+
+    return (journeyData || []).filter(j => {
+      // Time filter
+      if (j.first_at < minTs || j.first_at > maxTs) return false;
+
+      // Status filter
+      if (selectedStatusFilter !== 'all' && j.status !== selectedStatusFilter) {
+        return false;
+      }
+
+      // Camera filter
+      if (selectedCameraFilter === 'role_entry') {
+        const matches = (j.entry?.role === 'entry') || (j.cameras || []).some(c => c.role === 'entry');
+        if (!matches) return false;
+      } else if (selectedCameraFilter === 'role_exit') {
+        const matches = (j.exit?.role === 'exit') || (j.cameras || []).some(c => c.role === 'exit');
+        if (!matches) return false;
+      } else if (selectedCameraFilter === 'role_checkpoint') {
+        const matches = (j.cameras || []).some(c => c.role === 'checkpoint' || (c.role !== 'entry' && c.role !== 'exit'));
+        if (!matches) return false;
+      } else if (selectedCameraFilter !== 'all') {
+        const matchesCam = (j.cameras || []).some(c => c.stream === selectedCameraFilter || c.name === selectedCameraFilter)
+          || j.entry?.stream === selectedCameraFilter
+          || j.exit?.stream === selectedCameraFilter;
+        if (!matchesCam) return false;
+      }
+
+      // Search plate filter
+      if (searchPlate && !j.plate.includes(searchPlate.toUpperCase().trim())) {
+        return false;
+      }
+
+      return true;
+    });
+  }, [journeyData, timeFilter, customStart, customEnd, selectedStatusFilter, selectedCameraFilter, searchPlate]);
+
+  // Download ONLY the filtered list in front of the user
+  const handleExportExcel = () => {
+    if (!filteredJourneys || filteredJourneys.length === 0) {
+      alert('No vehicle journeys match the selected criteria to export.');
+      return;
+    }
+    setIsExporting(true);
+    try {
+      const apiOrigin = window.location.port === '8190' ? 'http://124.123.89.162:31016' : window.location.origin;
+
+      exportJourneysToExcel({
+        journeys: filteredJourneys,
+        apiOrigin
+      });
+
+      setExportNotice(`✅ Downloaded Excel: ${filteredJourneys.length} filtered vehicles!`);
+      setTimeout(() => setExportNotice(null), 4000);
+    } catch (err) {
+      alert('Error exporting Excel: ' + err.message);
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  const handleClearFilters = () => {
+    setSelectedCameraFilter('all');
+    setSelectedStatusFilter('all');
+    setSearchPlate('');
+    setTimeFilter('1h');
+  };
+
+  // Reset page when filters change
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [selectedCameraFilter, selectedStatusFilter, searchPlate, timeFilter, pageSize]);
+
+  // Pagination calculation
+  const totalPages = Math.max(1, Math.ceil(filteredJourneys.length / pageSize));
+  const paginatedJourneys = useMemo(() => {
+    const start = (currentPage - 1) * pageSize;
+    return filteredJourneys.slice(start, start + pageSize);
+  }, [filteredJourneys, currentPage, pageSize]);
+
+  // Dynamic video height and grid template columns based on number of active camera slots
+  const slotCount = activeSlots.length;
+  let gridColumns = `repeat(auto-fit, minmax(280px, 1fr))`;
+  let videoHeight = 220;
+
+  if (slotCount === 1) {
+    gridColumns = '1fr';
+    videoHeight = 440; // Full enlargement when viewing only 1 camera
+  } else if (slotCount === 2) {
+    gridColumns = 'repeat(2, 1fr)';
+    videoHeight = 330; // Medium enlargement when viewing 2 side-by-side
+  } else if (slotCount === 3) {
+    gridColumns = 'repeat(3, 1fr)';
+    videoHeight = 260;
+  } else if (slotCount >= 4) {
+    gridColumns = 'repeat(4, 1fr)';
+    videoHeight = 220;
+  }
+
+  return (
+    <div className="shell">
+      {/* ── Top Bar ── */}
+      <div className="topbar">
+        <div className="brand">
+          <div className="brand-mark">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="1" y="3" width="15" height="13" rx="2" /><polygon points="23 7 16 12 16 7" /><path d="M3 19h18" /><circle cx="7" cy="19" r="2" /><circle cx="17" cy="19" r="2" />
+            </svg>
+          </div>
+          <div>
+            <h1>Medanta Operations</h1>
+            <p>Hospital AI Suite • Vehicle Journey & ANPR Engine</p>
+          </div>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+          <span className={`status-pill ${engine?.running ? 'live' : 'down'}`}>
+            <span className="dot" />
+            GPU ANPR Engine • {engine?.running ? 'ACTIVE' : 'OFFLINE'}
+          </span>
+          <span style={{ fontSize: 12, fontWeight: 700, color: engine?.running ? '#22a06e' : '#c04848' }}>
+            🟢 {clockTime}
+          </span>
+        </div>
+      </div>
+
+      {error && <div className="notice err">⚠ Connection error: {error}</div>}
+      {engine?.model_error && <div className="notice err">⚠ Model error: {engine.model_error}</div>}
+
+      {/* ── KPI Cards ── */}
+      <div className="kpis">
+        <KpiCard label="VEHICLES TODAY" value={analytics?.vehicles_today ?? '—'} sub="Unique plate entries" color="var(--teal)" />
+        <KpiCard label="ON SITE NOW" value={analytics?.on_site ?? '—'} sub="Currently in premises" color="var(--blue)" />
+        <KpiCard label="UNIQUE PLATES" value={analytics?.unique_plates ?? '—'} sub={analytics?.hours ? `In last ${analytics.hours}h window` : 'In selected window'} color="var(--purple)" />
+        <KpiCard label="AVG DWELL TIME" value={analytics?.avg_dwell_ms ? dwell(analytics.avg_dwell_ms) : '—'} sub="Entry to exit average" color="var(--gold)" />
+      </div>
+
+      {/* ── Live Camera Grid Card with Dynamic Add/Remove & Auto-Enlarge ── */}
+      <div className="card span12" style={{ marginBottom: 16 }}>
+        {/* Head Bar */}
+        <div className="head" style={{ flexWrap: 'wrap', gap: 12, padding: '14px 18px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+            <h3 style={{ margin: 0 }}>
+              Live Vehicle Camera Feeds ({slotCount}-Slot Grid)
+            </h3>
+            <span className="badge" style={{ background: '#e3f6ef', color: '#17835c', fontSize: 9 }}>
+              ⚡ Inference running 24/7 on all {devices.length} cameras
+            </span>
+          </div>
+
+          {/* Quick Presets & Controls */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 10, fontWeight: 700, color: '#8ca0bc', textTransform: 'uppercase' }}>Presets:</span>
+            <button
+              className={`preset-btn ${slotCount === 1 ? 'active' : ''}`}
+              onClick={() => setPreset('1-focus')}
+              title="Focus on single camera in large format"
+            >
+              1 Feed (Large)
+            </button>
+            <button
+              className={`preset-btn ${slotCount === 2 && activeSlots.includes('mgptz') && activeSlots.includes('exit_gate') ? 'active' : ''}`}
+              onClick={() => setPreset('entry-exit')}
+              title="1 Entry + 1 Exit side by side"
+            >
+              1 Entry + 1 Exit
+            </button>
+            <button
+              className={`preset-btn ${slotCount === 2 && activeSlots.includes('mgptz') && activeSlots.includes('mg_outside') ? 'active' : ''}`}
+              onClick={() => setPreset('entry-pair')}
+              title="Both Entry Cameras side by side"
+            >
+              Entry Pair
+            </button>
+            <button
+              className={`preset-btn ${slotCount === 2 && activeSlots.includes('exit_gate') && activeSlots.includes('egtmp') ? 'active' : ''}`}
+              onClick={() => setPreset('exit-pair')}
+              title="Both Exit Cameras side by side"
+            >
+              Exit Pair
+            </button>
+            <button
+              className={`preset-btn ${slotCount >= 4 ? 'active' : ''}`}
+              onClick={() => setPreset('all-4')}
+              title="All 4 camera feeds"
+            >
+              All 4 Feeds
+            </button>
+            <button
+              className="btn sm"
+              onClick={handleAddSlot}
+              style={{ background: '#206e69', color: '#fff', borderColor: '#206e69', fontWeight: 700 }}
+              title="Add another camera slot to grid"
+            >
+              + Add Slot
+            </button>
+            <button className="btn sm primary" onClick={() => setAddOpen(true)}>
+              + Register Camera
+            </button>
+          </div>
+        </div>
+
+        {/* Dynamic Video Grid */}
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: gridColumns,
+          gap: 12,
+          padding: 14,
+          background: 'linear-gradient(180deg, #0f1925, #101e2e)',
+          borderRadius: '0 0 14px 14px'
+        }}>
+          {activeSlots.map((stream, i) => (
+            <CameraSlot
+              key={i + '-' + (stream || 'empty')}
+              slotIndex={i}
+              stream={stream}
+              devices={devices}
+              activeSlots={activeSlots}
+              onChangeSlot={handleSlotChange}
+              onRemoveSlot={handleRemoveSlot}
+              onFullscreen={(s) => setFullscreenStream(s)}
+              canRemove={activeSlots.length > 1}
+              engineWorkers={engine?.workers}
+              videoHeight={videoHeight}
+            />
+          ))}
+        </div>
+      </div>
+
+      {/* ── Main Content Grid ── */}
+      <div className="grid">
+        {/* Left: Journeys (with pagination & smart filtering) + Sightings */}
+        <div className="span8" style={{ display: 'grid', gap: 16 }}>
+          {/* Journey Table Card */}
+          <div className="card">
+            {/* Header: Title & Download Filtered List Button */}
+            <div className="head" style={{ flexWrap: 'wrap', gap: 10, padding: '14px 18px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                <h3 style={{ margin: 0, fontSize: 16 }}>🚗 Vehicle Journeys</h3>
+                <span className="badge" style={{ background: '#eef2f9', color: '#37465e', fontSize: 11, fontWeight: 700 }}>
+                  {filteredJourneys.length} matching filter{filteredJourneys.length !== 1 ? 's' : ''}
+                </span>
+                {exportNotice && (
+                  <span className="badge" style={{ background: '#e3f6ef', color: '#17835c', fontSize: 11, fontWeight: 700 }}>
+                    {exportNotice}
+                  </span>
+                )}
+              </div>
+
+              {/* Prominent Download Button */}
+              <button
+                className="btn sm"
+                onClick={handleExportExcel}
+                disabled={isExporting || filteredJourneys.length === 0}
+                style={{
+                  background: '#17835c',
+                  color: '#fff',
+                  borderColor: '#17835c',
+                  fontWeight: 700,
+                  fontSize: 11,
+                  padding: '7px 16px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  cursor: filteredJourneys.length > 0 ? 'pointer' : 'not-allowed',
+                  boxShadow: '0 2px 10px -2px rgba(23,131,92,0.55)'
+                }}
+                title="Download this exact filtered list as an Excel spreadsheet with photo links"
+              >
+                <span style={{ fontSize: 13 }}>📥</span>
+                <span>{isExporting ? 'Generating Excel…' : `Download Filtered Excel (${filteredJourneys.length} Vehicles)`}</span>
+              </button>
+            </div>
+
+            {/* Smart Filters Toolbar — Real-Time in front of the user */}
+            <div style={{
+              display: 'flex', alignItems: 'center', gap: 12, padding: '12px 18px',
+              borderBottom: '1px solid #eef2f7', background: '#fafbfc', flexWrap: 'wrap'
+            }}>
+              {/* Time Filter */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span style={{ fontSize: 10, fontWeight: 700, color: '#8ca0bc', textTransform: 'uppercase' }}>⏱ Time:</span>
+                <select
+                  value={timeFilter}
+                  onChange={e => setTimeFilter(e.target.value)}
+                  style={{ padding: '6px 10px', border: '1px solid #dfe6f0', borderRadius: 7, fontSize: 11, fontWeight: 700, background: '#fff' }}
+                >
+                  <option value="15m">Last 15 Mins</option>
+                  <option value="30m">Last 30 Mins</option>
+                  <option value="1h">Last 1 Hour (Default)</option>
+                  <option value="2h">Last 2 Hours</option>
+                  <option value="6h">Last 6 Hours</option>
+                  <option value="12h">Last 12 Hours</option>
+                  <option value="24h">Last 24 Hours</option>
+                  <option value="today">Today (Since Midnight)</option>
+                  <option value="7d">Last 7 Days (Daily Traffic)</option>
+                  <option value="custom">📅 Custom Date & Time…</option>
+                </select>
+              </div>
+
+              {/* Camera Filter */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span style={{ fontSize: 10, fontWeight: 700, color: '#8ca0bc', textTransform: 'uppercase' }}>📹 Camera:</span>
+                <select
+                  value={selectedCameraFilter}
+                  onChange={e => setSelectedCameraFilter(e.target.value)}
+                  style={{ padding: '6px 10px', border: '1px solid #dfe6f0', borderRadius: 7, fontSize: 11, fontWeight: 700, background: '#fff' }}
+                >
+                  <option value="all">All Cameras ({devices.length})</option>
+                  <option value="role_entry">🟢 Any Entry Gate</option>
+                  <option value="role_exit">🔵 Any Exit Gate</option>
+                  <option value="role_checkpoint">🟣 Any Checkpoint / Porch</option>
+                  <optgroup label="Specific Camera">
+                    {devices.map(d => (
+                      <option key={d.stream} value={d.stream}>
+                        📹 {d.name} ({d.role})
+                      </option>
+                    ))}
+                  </optgroup>
+                </select>
+              </div>
+
+              {/* Status Filter */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span style={{ fontSize: 10, fontWeight: 700, color: '#8ca0bc', textTransform: 'uppercase' }}>🚦 Status:</span>
+                <select
+                  value={selectedStatusFilter}
+                  onChange={e => setSelectedStatusFilter(e.target.value)}
+                  style={{ padding: '6px 10px', border: '1px solid #dfe6f0', borderRadius: 7, fontSize: 11, fontWeight: 700, background: '#fff' }}
+                >
+                  <option value="all">All Statuses</option>
+                  <option value="on_site">🟢 On Site Only</option>
+                  <option value="exited">🔵 Exited Only</option>
+                </select>
+              </div>
+
+              {/* Plate Search */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <input
+                  placeholder="🔍 Plate (e.g. HR26)…"
+                  value={searchPlate}
+                  onChange={e => setSearchPlate(e.target.value.toUpperCase())}
+                  style={{ padding: '6px 10px', border: '1px solid #dfe6f0', borderRadius: 7, fontSize: 11, fontWeight: 600, width: 140 }}
+                />
+              </div>
+
+              {/* Reset Filters button */}
+              {(selectedCameraFilter !== 'all' || selectedStatusFilter !== 'all' || searchPlate || timeFilter !== '1h') && (
+                <button
+                  className="btn sm"
+                  onClick={handleClearFilters}
+                  style={{ fontSize: 10, padding: '5px 10px', color: '#c04848', borderColor: '#f0b4b4', background: '#fff5f5' }}
+                >
+                  ✕ Reset Filters
+                </button>
+              )}
+            </div>
+
+            {/* Custom Date Range Picker (shown when custom is selected) */}
+            {timeFilter === 'custom' && (
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 10, padding: '8px 18px',
+                background: '#f0f9f5', borderBottom: '1px solid #cce8de', flexWrap: 'wrap'
+              }}>
+                <span style={{ fontSize: 11, fontWeight: 700, color: '#17835c' }}>📅 Custom Date/Time Range:</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <span style={{ fontSize: 10, color: '#5d7089', fontWeight: 600 }}>From:</span>
+                  <input
+                    type="datetime-local"
+                    value={customStart}
+                    onChange={e => setCustomStart(e.target.value)}
+                    style={{ border: '1px solid #bfe2d4', borderRadius: 6, fontSize: 11, padding: '4px 6px', fontWeight: 600, background: '#fff' }}
+                  />
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <span style={{ fontSize: 10, color: '#5d7089', fontWeight: 600 }}>To:</span>
+                  <input
+                    type="datetime-local"
+                    value={customEnd}
+                    onChange={e => setCustomEnd(e.target.value)}
+                    style={{ border: '1px solid #bfe2d4', borderRadius: 6, fontSize: 11, padding: '4px 6px', fontWeight: 600, background: '#fff' }}
+                  />
+                </div>
+                <button
+                  className="btn sm"
+                  onClick={() => {
+                    const d = new Date();
+                    d.setHours(d.getHours() - 1);
+                    setCustomStart(d.toISOString().slice(0, 16));
+                    setCustomEnd(new Date().toISOString().slice(0, 16));
+                  }}
+                  style={{ fontSize: 10, padding: '3px 8px' }}
+                >
+                  Last 1 Hour
+                </button>
+                <button
+                  className="btn sm"
+                  onClick={() => {
+                    const d = new Date();
+                    d.setHours(0, 0, 0, 0);
+                    setCustomStart(d.toISOString().slice(0, 16));
+                    setCustomEnd(new Date().toISOString().slice(0, 16));
+                  }}
+                  style={{ fontSize: 10, padding: '3px 8px' }}
+                >
+                  Today
+                </button>
+              </div>
+            )}
+
+            {/* List Overview Subbar with Rows Per Page */}
+            <div style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              padding: '8px 18px', background: '#f8fafd', borderBottom: '1px solid #eef2f7',
+              fontSize: 11, color: '#5d7089', fontWeight: 600
+            }}>
+              <div>
+                Showing <b>{filteredJourneys.length}</b> vehicles in list
+                {filteredJourneys.length !== journeyData.length && (
+                  <span style={{ color: '#8ca0bc', marginLeft: 6 }}>
+                    (filtered from {journeyData.length} in database)
+                  </span>
+                )}
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span>Rows per page:</span>
+                <select
+                  value={pageSize}
+                  onChange={e => setPageSize(Number(e.target.value))}
+                  style={{ padding: '3px 6px', border: '1px solid #dfe6f0', borderRadius: 5, fontSize: 11, fontWeight: 600, background: '#fff' }}
+                >
+                  <option value={15}>15</option>
+                  <option value={25}>25</option>
+                  <option value={50}>50</option>
+                  <option value={100}>100</option>
+                  <option value={10000}>All</option>
+                </select>
+              </div>
+            </div>
+
+            {/* Compact Scrollable Table Container */}
+            <div style={{ overflowX: 'auto', maxHeight: 520, overflowY: 'auto' }}>
+              <table className="tbl">
+                <thead style={{ position: 'sticky', top: 0, background: '#fff', zIndex: 2 }}>
+                  <tr>
+                    <th>Plate</th>
+                    <th>Status</th>
+                    <th>Entry Camera</th>
+                    <th>Entry Time</th>
+                    <th>Exit Camera</th>
+                    <th>Exit Time</th>
+                    <th>Dwell</th>
+                    <th>Cameras Seen</th>
+                    <th style={{ textAlign: 'center' }}>Reads</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {paginatedJourneys.map((j, i) => (
+                    <JourneyFlow
+                      key={j.plate + j.first_at}
+                      journey={j}
+                      expanded={expandedJourney === i}
+                      onToggle={() => setExpandedJourney(expandedJourney === i ? null : i)}
+                      onOpenSightingPhoto={(info) => setSelectedSightingModal(info)}
+                    />
+                  ))}
+                  {filteredJourneys.length === 0 && (
+                    <tr><td colSpan={9} className="empty">No vehicle journeys match the selected criteria</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Pagination Controls */}
+            <div className="pagination-bar">
+              <div style={{ fontSize: 11, color: '#5d7089', fontWeight: 600 }}>
+                Showing {filteredJourneys.length > 0 ? (currentPage - 1) * pageSize + 1 : 0}–{Math.min(currentPage * pageSize, filteredJourneys.length)} of {filteredJourneys.length} journeys
+                {filteredJourneys.length !== journeyData.length && (
+                  <span style={{ color: '#8ca0bc', marginLeft: 4 }}>
+                    (filtered from {journeyData.length} total)
+                  </span>
+                )}
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <span style={{ fontSize: 10, color: '#8ca0bc', fontWeight: 700 }}>Rows:</span>
+                  <select
+                    value={pageSize}
+                    onChange={e => setPageSize(Number(e.target.value))}
+                    style={{ padding: '4px 8px', border: '1px solid #dfe6f0', borderRadius: 6, fontSize: 10, fontWeight: 700 }}
+                  >
+                    <option value={15}>15</option>
+                    <option value={25}>25</option>
+                    <option value={50}>50</option>
+                    <option value={100}>100</option>
+                  </select>
+                </div>
+
+                <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <button
+                    className="page-btn"
+                    disabled={currentPage <= 1}
+                    onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                  >
+                    ‹ Prev
+                  </button>
+                  <span style={{ fontSize: 11, fontWeight: 700, padding: '0 6px', color: '#37465e' }}>
+                    {currentPage} / {totalPages}
+                  </span>
+                  <button
+                    className="page-btn"
+                    disabled={currentPage >= totalPages}
+                    onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                  >
+                    Next ›
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* ── Gate Traffic & Flow Analysis Card ── */}
+          <GateAnalyticsCard
+            analytics={analytics}
+            devices={devices}
+            timeFilter={timeFilter}
+            setTimeFilter={setTimeFilter}
+          />
+        </div>
+
+        {/* Right: Engine Status + Rules + Registered Cameras */}
+        <div className="span4" style={{ display: 'grid', gap: 16, alignContent: 'start' }}>
+          {/* Engine Status */}
+          <div className="card">
+            <div className="head">
+              <h3>⚙️ Engine Status</h3>
+              <span className={`badge ${engine?.running ? 'on_site' : 'err'}`}>
+                {engine?.running ? 'RUNNING' : 'OFFLINE'}
+              </span>
+            </div>
+            <div className="body" style={{ fontSize: 11 }}>
+              <div style={{ display: 'grid', gap: 6 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span className="muted">Model</span>
+                  <b>{engine?.model || '—'}</b>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span className="muted">Total Scans</span>
+                  <b>{engine?.scans ?? '—'}</b>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span className="muted">Total Sightings</span>
+                  <b>{engine?.sightings ?? '—'}</b>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span className="muted">Passages Recorded</span>
+                  <b>{engine?.passages ?? '—'}</b>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span className="muted">Object Backends</span>
+                  <b>{engine?.objects_backends ?? '—'}</b>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Journey Rules */}
+          <div className="card">
+            <div className="head"><h3>🔧 Journey Rules</h3></div>
+            <div className="body">
+              <RulesPanel rules={rules} onUpdate={loadState} />
+            </div>
+          </div>
+
+          {/* Registered Cameras */}
+          <div className="card">
+            <div className="head"><h3>📹 Cameras</h3></div>
+            <div className="body">
+              <RegisteredCameras
+                devices={devices}
+                activeSlots={activeSlots}
+                onToggleViewSlot={handleToggleViewSlot}
+                onEditCamera={d => setEditDevice(d)}
+                onOpenAdd={() => setAddOpen(true)}
+              />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Lightbox & Modals ── */}
+      <FullscreenModal
+        stream={fullscreenStream}
+        device={deviceMap[fullscreenStream]}
+        worker={engine?.workers?.[fullscreenStream]}
+        onClose={() => setFullscreenStream(null)}
+      />
+
+      <SightingModal
+        sighting={selectedSightingModal}
+        deviceMap={deviceMap}
+        onClose={() => setSelectedSightingModal(null)}
+      />
+
+      <AddCameraModal
+        open={addOpen}
+        onClose={() => setAddOpen(false)}
+        onAdd={() => loadState()}
+      />
+
+      <EditCameraModal
+        device={editDevice}
+        open={!!editDevice}
+        onClose={() => setEditDevice(null)}
+        onSave={() => { setEditDevice(null); loadState(); }}
+        onDelete={() => { setEditDevice(null); loadState(); }}
+      />
+    </div>
+  );
+}
+
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+  componentDidCatch(error, errorInfo) {
+    console.error('Vehicle Tracker UI Error:', error, errorInfo);
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{ padding: 40, fontFamily: 'Inter, sans-serif', maxWidth: 640, margin: '60px auto', background: '#fff', borderRadius: 12, boxShadow: '0 4px 24px rgba(0,0,0,0.08)', border: '1px solid #fee2e2' }}>
+          <h2 style={{ color: '#dc2626', margin: '0 0 10px 0', fontSize: 20 }}>Vehicle Tracker UI Encountered an Error</h2>
+          <p style={{ color: '#475569', fontSize: 13, margin: '0 0 16px 0' }}>An unexpected error occurred during rendering:</p>
+          <pre style={{ background: '#fef2f2', padding: 14, borderRadius: 8, overflowX: 'auto', fontSize: 12, color: '#991b1b', border: '1px solid #fecaca' }}>
+            {this.state.error?.toString()}
+          </pre>
+          <button
+            onClick={() => window.location.reload()}
+            style={{ marginTop: 18, padding: '9px 18px', background: '#1d4ed8', color: '#fff', border: 'none', borderRadius: 7, cursor: 'pointer', fontWeight: 700, fontSize: 13 }}
+          >
+            🔄 Reload Dashboard
+          </button>
+        </div>
+      );
+    }
+    return this.props?.children || null;
+  }
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <ErrorBoundary>
+    <App />
+  </ErrorBoundary>
+);
