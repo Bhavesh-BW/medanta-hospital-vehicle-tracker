@@ -11,7 +11,7 @@ Auth: X-Local-Vision-Key header, same shared key as the other vision services.
 import base64
 import collections
 import hmac
-import json
+import json 
 import os
 import pathlib
 import re
@@ -32,14 +32,6 @@ MODELS = ROOT / '.vision-models'
 DB_PATH = os.environ.get('TRACKER_DB', '/data/vehicle_tracker.db')
 RTSP_BASE = os.environ.get('RTSP_BASE', 'rtsp://124.123.89.162:31554/live')
 OBJECTS_URLS = [u.strip() for u in os.environ.get('OBJECTS_URLS', 'http://172.17.0.1:31012,http://172.17.0.1:31013').split(',') if u.strip()]
-
-# IST Timezone helper (+05:30)
-IST_OFFSET_SEC = int(5.5 * 3600)
-IST_OFFSET_MS = int(5.5 * 3600 * 1000)
-
-def to_ist_strftime(epoch_sec=None, fmt='%Y-%m-%d %H:%M:%S'):
-    sec = epoch_sec if epoch_sec is not None else time.time()
-    return time.strftime(fmt, time.gmtime(sec + IST_OFFSET_SEC))
 STREAM_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]{0,40}$')
 ROLES = ('entry', 'exit', 'checkpoint')
 MIME_TYPES = {
@@ -60,7 +52,91 @@ CHARSET = '0123456789abcdefghijklmnopqrstuvwxyz'
 STRICT_RE = re.compile(r'^[a-z]{2}\d{1,2}[a-z]{1,3}\d{4}$')
 TO_DIGIT = {'o': '0', 'q': '0', 'd': '0', 'i': '1', 'l': '1', 'j': '1', 't': '7', 'z': '2', 's': '5', 'b': '8', 'g': '6', 'a': '4'}
 TO_LETTER = {'0': 'o', '1': 'i', '2': 'z', '3': 'e', '4': 'a', '5': 's', '6': 'g', '7': 't', '8': 'b'}
-INDIAN_STATES = {'hr', 'dl', 'up', 'mh', 'ka', 'pb', 'ch', 'uk', 'rj', 'mp', 'gj', 'wb', 'tn', 'kl', 'ap', 'ts', 'br', 'jh', 'od', 'as', 'ga', 'jk', 'hp', 'tr', 'nl', 'mn', 'mz', 'sk', 'bh'}
+# All 36 Indian States and Union Territories
+ALL_INDIAN_STATES = {
+    'an', 'ap', 'ar', 'as', 'br', 'cg', 'ch', 'dd', 'dl', 'dn',
+    'ga', 'gj', 'hp', 'hr', 'jh', 'jk', 'ka', 'kl', 'la', 'ld',
+    'mh', 'ml', 'mn', 'mp', 'mz', 'nl', 'od', 'pb', 'py', 'rj',
+    'sk', 'tn', 'tr', 'ts', 'uk', 'up', 'wb'
+}
+INDIAN_STATES = ALL_INDIAN_STATES
+
+STATE_PREFIX_MAP = {
+    **{s: s for s in ALL_INDIAN_STATES},
+    # Rajasthan (RJ)
+    'ee': 'rj', 'ej': 'rj', 'pj': 'rj', 'bj': 'rj', 'ri': 'rj', 'r1': 'rj', '8j': 'rj',
+    # Haryana (HR)
+    'kc': 'hr', 'hc': 'hr', 'kr': 'hr', 'rc': 'hr', 'ir': 'hr', '1r': 'hr',
+    'cl': 'hr', 'co': 'hr', 'cp': 'hr', 'ce': 'hr', 'ca': 'hr', 'cc': 'hr', 'cs': 'hr',
+    # Delhi (DL)
+    'ol': 'dl', '0l': 'dl', 'di': 'dl', 'd1': 'dl', 'ql': 'dl',
+    # Uttar Pradesh (UP)
+    'vp': 'up', 'jp': 'up', '0p': 'up', 'op': 'up', 'uf': 'up', 'ub': 'up',
+    # Maharashtra (MH)
+    'nh': 'mh', 'mi': 'mh', 'm1': 'mh', 'wh': 'mh',
+    # Karnataka (KA)
+    'ha': 'ka', 'k4': 'ka', '1a': 'ka', 'ia': 'ka',
+    # Gujarat (GJ)
+    'g1': 'gj', 'gi': 'gj', 'oj': 'gj', '6j': 'gj',
+    # Tamil Nadu (TN)
+    '7n': 'tn', 'in': 'tn', '1n': 'tn', 'tm': 'tn',
+    # Kerala (KL)
+    'k1': 'kl', 'ki': 'kl', 'hl': 'kl',
+    # Telangana (TS)
+    '7s': 'ts', 'is': 'ts', '1s': 'ts', 't5': 'ts',
+    # Andhra Pradesh (AP)
+    'a9': 'ap', '4p': 'ap', 'af': 'ap',
+    # West Bengal (WB)
+    'w8': 'wb', 'vb': 'wb', 'mb': 'wb',
+    # Madhya Pradesh (MP)
+    'np': 'mp', 'm9': 'mp', 'mf': 'mp',
+    # Punjab (PB)
+    'p8': 'pb', 'fb': 'pb',
+    # Chandigarh (CH)
+    'c4': 'ch', 'gh': 'ch',
+    # Uttarakhand (UK)
+    'vk': 'uk', '0k': 'uk', 'ok': 'uk',
+    # Bihar (BR)
+    '8r': 'br', 'b8': 'br',
+    # Jharkhand (JH)
+    'ih': 'jh', '1h': 'jh',
+    # Himachal Pradesh (HP)
+    'h9': 'hp', 'hf': 'hp',
+    # Odisha (OD)
+    '0d': 'od', 'qd': 'od',
+    # Assam (AS)
+    'a5': 'as', '4s': 'as',
+    # Goa (GA)
+    'g4': 'ga', '6a': 'ga',
+    # Chhattisgarh (CG)
+    'c6': 'cg'
+}
+
+def check_bh_series(clean):
+    """Detect and normalize Bharat (BH) series license plates: YY BH #### XX"""
+    if len(clean) in (9, 10):
+        mid2 = clean[2:4]
+        if mid2 in ('bh', '8h', '6h', 'dh', 'bi', 'b1', 'bb'):
+            year = ''.join(NIGHT_DIGIT_MAP.get(c, c) for c in clean[:2])
+            if year.isdigit() and 21 <= int(year) <= 29:
+                num = ''.join(NIGHT_DIGIT_MAP.get(c, c) for c in clean[4:8])
+                series = ''.join(clean[8:])
+                if num.isdigit() and len(num) == 4 and series.isalpha():
+                    return f"{year}bh{num}{series}".upper()
+    return None
+NIGHT_DIGIT_MAP = {
+    '0': '0', '1': '1', '2': '2', '3': '3', '4': '4', '5': '5', '6': '6', '7': '7', '8': '8', '9': '9',
+    'o': '0', 'q': '0', 'e': '0', 'u': '0',
+    'i': '1', 'l': '1', 'j': '1',
+    'z': '2', 'r': '2',
+    'd': '3',
+    'a': '7', 't': '7', 'y': '7',
+    'c': '4', 'h': '4',
+    's': '5',
+    'g': '6', 'p': '6',
+    'b': '8',
+    'k': '0', 'm': '0'
+}
 GARBAGE_WORDS = [
     'exit', 'gate', 'entry', 'main', 'medanta', 'app', 'hospital',
     'outside', 'ptz', 'egtmp', 'speed', 'slow', 'stop', 'police',
@@ -108,6 +184,9 @@ def fix_plate(raw_text):
     text = clean_indian_text(raw_text)
     if is_garbage_text(text):
         return None
+    bh = check_bh_series(text)
+    if bh:
+        return bh
     if len(text) < 7 or len(text) > 11:
         return None
     if text[:2] not in INDIAN_STATES:
@@ -148,6 +227,31 @@ def fix_plate(raw_text):
             return candidate
     return None
 cv2.setNumThreads(4)
+# ── Night-mode adaptive helpers ──────────────────────────────────────────
+LOW_LIGHT_THRESH = 120  # frame mean brightness below this triggers night mode
+_clahe_frame = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+_clahe_plate = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(4, 4))
+
+def is_low_light(frame):
+    """Fast brightness check (~0.2 ms on 1280x720). Uses a downsampled grayscale mean."""
+    small = cv2.resize(frame, (320, 180))
+    return float(np.mean(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY))) < LOW_LIGHT_THRESH
+
+def night_enhance(frame):
+    """CLAHE in LAB colour space — lifts dark vehicles without clipping highlights.
+    Only call when is_low_light() is True; day frames must skip this entirely."""
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    l = _clahe_frame.apply(l)
+    return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+
+def enhance_plate_crop(gray):
+    """Stroke-preserving enhancement for CRNN in low-light: bicubic resize + min-max stretch + unsharp mask."""
+    resized = cv2.resize(gray, (100, 32), interpolation=cv2.INTER_CUBIC)
+    norm = cv2.normalize(resized, None, 0, 255, cv2.NORM_MINMAX)
+    blur = cv2.GaussianBlur(norm, (0, 0), 1.0)
+    return cv2.addWeighted(norm, 1.8, blur, -0.8, 0)
+
 class VehicleDetector:
     """YOLOv8n detector on CUDA Execution Provider (~4.5ms) for confirming vehicles."""
     def __init__(self):
@@ -230,11 +334,13 @@ class Detector:
         mask = np.zeros(frame.shape[:2], dtype=np.uint8) + 255
         mask[:int(frame.shape[0] * 0.12), :] = 0
         return mask
-    def ocr(self, image, quad):
+    def ocr(self, image, quad, low_light=False):
         dst = np.array([[0, 31], [0, 0], [99, 0], [99, 31]], dtype=np.float32)
         matrix = cv2.getPerspectiveTransform(quad.astype(np.float32), dst)
         crop = cv2.warpPerspective(image, matrix, (100, 32))
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        if low_light:
+            gray = enhance_plate_crop(gray)
         self.recognizer.setInput(cv2.dnn.blobFromImage(gray, size=(100, 32), mean=127.5, scalefactor=1 / 127.5))
         out = self.recognizer.forward()
         text = ''
@@ -244,12 +350,26 @@ class Detector:
         return ''.join(char for i, char in enumerate(text) if char != '-' and (i == 0 or char != text[i - 1]))
     def scan(self, frame):
         h, w = frame.shape[:2]
+        # ── Night-mode detection (adaptive, zero cost on day frames) ──
+        low_light = is_low_light(frame)
+        if low_light:
+            detect_frame = night_enhance(frame)
+            vehicle_thresh = 0.12
+        else:
+            detect_frame = frame
+            vehicle_thresh = 0.28
         # ── STAGE 1: Confirm Vehicle Presence First ───────────────────
-        vehicles = self.vehicle_detector.detect(frame, conf_thresh=0.28)
+        vehicles = self.vehicle_detector.detect(detect_frame, conf_thresh=vehicle_thresh)
         if not vehicles:
             # No vehicle present in frame -> no plate can exist. Completely skips signs, watermarks & pavement.
             return [], []
         # ── STAGE 2: Plate Detection inside Confirmed Vehicles ─────────
+        # In night mode, use the CLAHE-enhanced frame for text detection too
+        ocr_frame = detect_frame if low_light else frame
+        # Relax DBNet thresholds for low-light so faint plate edges are kept
+        if low_light:
+            self.detector.setBinaryThreshold(0.2)
+            self.detector.setPolygonThreshold(0.30)
         mask = self.timestamp_mask(frame)
         tiles = [
             (0, 0, int(w * 0.55), int(h * 0.58)),
@@ -258,10 +378,13 @@ class Detector:
             (int(w * 0.45), int(h * 0.44), w, h),
             (int(w * 0.22), int(h * 0.25), int(w * 0.78), int(h * 0.85))
         ]
+        if low_light:
+            # Gate Barrier Lane ROI: ensures occluded plates at the boom barrier are scanned at high resolution
+            tiles.append((int(w * 0.23), int(h * 0.05), int(w * 0.65), int(h * 0.62)))
         detections = []
         seen_quads = []
         for x0, y0, x1, y1 in tiles:
-            tile = frame[y0:y1, x0:x1].copy()
+            tile = ocr_frame[y0:y1, x0:x1].copy()
             tile_mask = mask[y0:y1, x0:x1]
             tile[tile_mask == 0] = 128
             try:
@@ -288,17 +411,22 @@ class Detector:
                 for v in vehicles:
                     vx1, vy1, vx2, vy2 = v['bbox']
                     pad_w = (vx2 - vx1) * 0.12
-                    pad_h = (vy2 - vy1) * 0.12
-                    if (vx1 - pad_w) <= cx <= (vx2 + pad_w) and (vy1 - pad_h) <= cy <= (vy2 + pad_h):
+                    pad_h_top = (vy2 - vy1) * 0.12
+                    pad_h_bottom = (vy2 - vy1) * (0.35 if low_light else 0.12)
+                    if (vx1 - pad_w) <= cx <= (vx2 + pad_w) and (vy1 - pad_h_top) <= cy <= (vy2 + pad_h_bottom):
                         matching_vehicle = v
                         break
+                if matching_vehicle is None and low_light:
+                    # In low-light gate lane, vehicles partially occluded by barrier arm are valid
+                    if int(w * 0.25) <= cx <= int(w * 0.65) and int(h * 0.10) <= cy <= int(h * 0.60):
+                        matching_vehicle = {'name': 'gate_vehicle', 'bbox': [int(w * 0.25), int(h * 0.10), int(w * 0.65), int(h * 0.60)]}
                 if matching_vehicle is None:
                     continue
                 if any(np.hypot(center[0] - sc[0], center[1] - sc[1]) < 25 for sc in seen_quads):
                     continue
                 if cy < mask.shape[0] and cx < mask.shape[1] and mask[cy, cx] == 0:
                     continue
-                raw_text = self.ocr(frame, quad)
+                raw_text = self.ocr(ocr_frame, quad, low_light=low_light)
                 if not raw_text or len(raw_text) < 4:
                     continue
                 if is_garbage_text(raw_text):
@@ -315,6 +443,10 @@ class Detector:
                     'vehicle_bbox': matching_vehicle['bbox'],
                     'vehicle_name': matching_vehicle['name']
                 })
+        # Restore default DBNet thresholds so day frames are unaffected
+        if low_light:
+            self.detector.setBinaryThreshold(0.3)
+            self.detector.setPolygonThreshold(0.45)
         return detections, vehicles
 class Store:
     def __init__(self, path):
@@ -838,8 +970,8 @@ class Handler(BaseHTTPRequestHandler):
                 host_header = self.headers.get('Host', '124.123.89.162:31016')
                 base_url = f"http://{host_header}" if not host_header.startswith('http') else host_header
                 for idx, j in enumerate(result, 1):
-                    first_ts = to_ist_strftime(j['first_at'] / 1000) if j.get('first_at') else '—'
-                    last_ts = to_ist_strftime(j['exit']['at'] / 1000) if j.get('exit') and j['exit'].get('at') else '—'
+                    first_ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(j['first_at'] / 1000)) if j.get('first_at') else '—'
+                    last_ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(j['exit']['at'] / 1000)) if j.get('exit') and j['exit'].get('at') else '—'
                     dwell_sec = int(j.get('dwell_ms', 0) / 1000)
                     dwell_str = f"{dwell_sec // 60}m {dwell_sec % 60}s" if dwell_sec >= 60 else f"{dwell_sec}s"
                     dwell_min = round(dwell_sec / 60.0, 1)
@@ -854,7 +986,7 @@ class Handler(BaseHTTPRequestHandler):
                 payload = out.getvalue().encode('utf-8-sig')
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/csv; charset=utf-8')
-                self.send_header('Content-Disposition', 'attachment; filename="Medanta_Vehicle_Journeys_' + to_ist_strftime(time.time(), '%Y%m%d_%H%M%S') + '.csv"')
+                self.send_header('Content-Disposition', 'attachment; filename="Medanta_Vehicle_Journeys_' + time.strftime('%Y%m%d_%H%M%S') + '.csv"')
                 self.send_header('Content-Length', str(len(payload)))
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
@@ -871,10 +1003,7 @@ class Handler(BaseHTTPRequestHandler):
                 hours = min(720, max(1, float(query.get('hours', ['24'])[0])))
                 since = int(time.time() * 1000 - hours * 3600000)
                 visits = journeys(self.store, since)
-                # Compute today's start in IST timezone
-                now_sec = int(time.time())
-                seconds_today_in_ist = (now_sec + IST_OFFSET_SEC) % 86400
-                today = (now_sec - seconds_today_in_ist) * 1000
+                today = int(time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1)) * 1000)
                 dwell = [v['dwell_ms'] for v in visits if v['status'] == 'exited']
                 per_camera = collections.Counter()
                 for v in visits:
@@ -883,9 +1012,7 @@ class Handler(BaseHTTPRequestHandler):
                 bucket_ms = 3600000
                 hourly = collections.Counter()
                 for v in visits:
-                    # Align to IST hourly buckets
-                    ist_bucket = (v['first_at'] + IST_OFFSET_MS) // bucket_ms * bucket_ms - IST_OFFSET_MS
-                    hourly[ist_bucket] += 1
+                    hourly[v['first_at'] // bucket_ms * bucket_ms] += 1
                 return self.send_json(200, {
                     'vehicles_today': sum(1 for v in visits if v['first_at'] >= today),
                     'on_site': sum(1 for v in visits if v['status'] == 'on_site'),
