@@ -65,3 +65,11 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+
+# Backup and temporary editor files
+*.bak*
+*.backup
+*.old
+*.swp
+*.swo
+feed_mode.json

@@ -13,7 +13,7 @@ import './theme.css';
 import * as XLSX from 'xlsx';
 
 const API = '/api';
-const POLL_INTERVAL = 3000;
+const POLL_INTERVAL = 4000;
 
 /* ── Helpers ─────────────────────────────────────────────── */
 
@@ -65,7 +65,7 @@ function KpiCard({ label, value, sub, color }) {
 
 /* ── Fullscreen Stream Modal ──────────────────────────────── */
 
-function FullscreenModal({ stream, device, worker, onClose }) {
+function FullscreenModal({ stream, device, worker, feedSource, onClose }) {
   useEffect(() => {
     const handleKeyDown = (e) => {
       if (e.key === 'Escape') onClose();
@@ -109,7 +109,7 @@ function FullscreenModal({ stream, device, worker, onClose }) {
       </div>
       <div className="fullscreen-body" onClick={onClose}>
         <img
-          src={`${API}/devices/${stream}/stream.mjpg`}
+          src={`${API}/devices/${stream}/stream.mjpg?mode=${feedSource || 'live'}`}
           alt={device?.name || stream}
           onClick={(e) => e.stopPropagation()}
         />
@@ -264,7 +264,8 @@ function CameraSlot({
   onFullscreen,
   canRemove,
   engineWorkers,
-  videoHeight
+  videoHeight,
+  feedSource
 }) {
   const device = devices.find(d => d.stream === stream);
   const worker = stream ? engineWorkers?.[stream] : null;
@@ -352,12 +353,18 @@ function CameraSlot({
         transition: 'height 0.2s ease-in-out'
       }}>
         {stream ? (
-          <img
-            src={`${API}/devices/${stream}/stream.mjpg`}
-            alt={device?.name || stream}
-            style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }}
-            onError={(e) => { e.target.style.display = 'none'; }}
-          />
+          feedSource ? (
+            <img
+              src={`${API}/devices/${stream}/stream.mjpg?mode=${feedSource}`}
+              alt={device?.name || stream}
+              style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }}
+              onError={(e) => { e.target.style.display = 'none'; }}
+            />
+          ) : (
+            <div style={{ color: '#5d7089', fontSize: 11, textAlign: 'center', padding: 20 }}>
+              Connecting stream...
+            </div>
+          )
         ) : (
           <div style={{ color: '#5d7089', fontSize: 11, textAlign: 'center', padding: 20 }}>
             No camera assigned to Slot {slotIndex + 1}<br />
@@ -1351,6 +1358,7 @@ function App() {
     return () => clearInterval(timer);
   }, []);
 
+  const [feedSource, setFeedSource] = useState(null);
   const [state, setState] = useState(null);
   const [analytics, setAnalytics] = useState(null);
   const [journeyData, setJourneyData] = useState([]);
@@ -1380,7 +1388,7 @@ function App() {
     try {
       const saved = localStorage.getItem('vehicle_tracker_view_slots');
       if (saved) return JSON.parse(saved);
-    } catch {}
+    } catch { }
     return ['mgptz', 'mg_outside', 'exit_gate', 'egtmp'];
   });
 
@@ -1404,7 +1412,7 @@ function App() {
     setActiveSlots(newSlots);
     try {
       localStorage.setItem('vehicle_tracker_view_slots', JSON.stringify(newSlots));
-    } catch {}
+    } catch { }
   }, []);
 
   // Presets
@@ -1475,6 +1483,7 @@ function App() {
         api('/analytics?hours=' + queryHours),
         api('/journeys?hours=' + queryHours + (searchPlate ? '&plate=' + searchPlate : ''))
       ]);
+      if (stateData?.feed_mode) setFeedSource(stateData.feed_mode);
       setState(stateData);
       setAnalytics(analyticsData);
       setJourneyData(journeyRes.journeys || []);
@@ -1483,6 +1492,19 @@ function App() {
       setError(err.message);
     }
   }, [timeFilter, customStart, searchPlate]);
+
+  const handleToggleFeedSource = async () => {
+    const nextMode = feedSource === 'demo' ? 'live' : 'demo';
+    try {
+      const res = await api('/feed-source', { mode: nextMode });
+      if (res?.mode) {
+        setFeedSource(res.mode);
+        loadState();
+      }
+    } catch (e) {
+      console.error("Toggle feed source error:", e);
+    }
+  };
 
   useEffect(() => {
     loadState();
@@ -1625,6 +1647,38 @@ function App() {
           </div>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+          <button
+            type="button"
+            onClick={handleToggleFeedSource}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '7px',
+              padding: '6px 14px',
+              borderRadius: '8px',
+              fontSize: '12px',
+              fontWeight: '700',
+              cursor: 'pointer',
+              border: feedSource === 'demo' ? '1.5px solid #8b5cf6' : '1.5px solid #10b981',
+              backgroundColor: feedSource === 'demo' ? '#f5f3ff' : '#ecfdf5',
+              color: feedSource === 'demo' ? '#6d28d9' : '#047857',
+              boxShadow: '0 1px 2px rgba(0,0,0,0.04)',
+              transition: 'all 0.2s ease'
+            }}
+            title={feedSource === 'demo' ? "Currently playing Demo Recordings. Click to switch to Live RTSP Feeds." : "Currently streaming Live RTSP Feeds. Click to switch to Demo Recordings."}
+          >
+            <span style={{
+              width: '8px',
+              height: '8px',
+              borderRadius: '50%',
+              backgroundColor: feedSource === 'demo' ? '#7c3aed' : '#10b981',
+              boxShadow: feedSource === 'demo' ? '0 0 6px #7c3aed' : '0 0 6px #10b981'
+            }}></span>
+            <span>{feedSource === 'demo' ? '🎬 Demo Mode (Recordings)' : '🟢 Live Feeds Active'}</span>
+            <span style={{ fontSize: '10px', opacity: 0.7, textDecoration: 'underline', marginLeft: '2px' }}>
+              (Switch)
+            </span>
+          </button>
           <span className={`status-pill ${engine?.running ? 'live' : 'down'}`}>
             <span className="dot" />
             GPU ANPR Engine • {engine?.running ? 'ACTIVE' : 'OFFLINE'}
@@ -1722,7 +1776,7 @@ function App() {
         }}>
           {activeSlots.map((stream, i) => (
             <CameraSlot
-              key={i + '-' + (stream || 'empty')}
+              key={i + '-' + (stream || 'empty') + '-' + feedSource}
               slotIndex={i}
               stream={stream}
               devices={devices}
@@ -1733,6 +1787,7 @@ function App() {
               canRemove={activeSlots.length > 1}
               engineWorkers={engine?.workers}
               videoHeight={videoHeight}
+              feedSource={feedSource}
             />
           ))}
         </div>
@@ -2105,6 +2160,7 @@ function App() {
         stream={fullscreenStream}
         device={deviceMap[fullscreenStream]}
         worker={engine?.workers?.[fullscreenStream]}
+        feedSource={feedSource}
         onClose={() => setFullscreenStream(null)}
       />
 

@@ -29,7 +29,61 @@ ROOT = pathlib.Path(__file__).resolve().parent
 DIST_DIR = ROOT / 'dist'
 KEY = os.environ.get('VISION_SERVICE_KEY', '')
 MODELS = ROOT / '.vision-models'
-DB_PATH = os.environ.get('TRACKER_DB', '/data/vehicle_tracker.db')
+LIVE_DB_PATH = os.environ.get('TRACKER_DB', str(ROOT / 'vehicle_tracker.db') if (os.name == 'nt' or not os.path.exists('/data')) else '/data/vehicle_tracker.db')
+DEMO_DB_PATH = '/data/vehicle_tracker_demo.db' if os.path.exists('/data') else str(ROOT / 'vehicle_tracker_demo.db')
+RECORDINGS_DIR = pathlib.Path('/data/recordings') if os.path.exists('/data/recordings') else (ROOT / 'recordings' if (ROOT / 'recordings').exists() else pathlib.Path(r"d:\Python Projects\recordings"))
+
+def get_playlist(path_or_dir):
+    if not path_or_dir:
+        return []
+    p = str(path_or_dir)
+    if os.path.isdir(p):
+        files = sorted([
+            os.path.join(p, f) for f in os.listdir(p)
+            if f.lower().endswith(('.mp4', '.avi', '.mkv', '.mov', '.ts'))
+        ])
+        if files:
+            return files
+    if not os.path.exists(p) and os.path.isdir(os.path.dirname(p)):
+        parent = os.path.dirname(p)
+        prefix = os.path.basename(p)
+        matched = sorted([
+            os.path.join(parent, f) for f in os.listdir(parent)
+            if f.lower().startswith(prefix.lower()) and f.lower().endswith(('.mp4', '.avi', '.mkv', '.mov', '.ts'))
+        ])
+        if matched:
+            return matched
+    if os.path.isfile(p):
+        return [p]
+    return [p]
+
+DEMO_VEHICLE_RECORDINGS = {
+    'mgptz': str(RECORDINGS_DIR / "mgptz"),
+    'mg_outside': str(RECORDINGS_DIR / "mg_outside"),
+    'MgOutside': str(RECORDINGS_DIR / "mg_outside"),
+    'exit_gate': str(RECORDINGS_DIR / "exit_gate"),
+    'ExitGate': str(RECORDINGS_DIR / "exit_gate"),
+    'egtmp': str(RECORDINGS_DIR / "egtmp"),
+    'EgToMp': str(RECORDINGS_DIR / "egtmp"),
+    'basement': str(RECORDINGS_DIR / "basement"),
+    'basement_entry': str(RECORDINGS_DIR / "basement"),
+}
+DEFAULT_VEHICLE_DEVICES = [
+    {'stream': 'mgptz', 'name': 'Main Gate PTZ (Entry)', 'role': 'entry', 'anpr': 1, 'url': ''},
+    {'stream': 'mg_outside', 'name': 'Main Gate Outside (Inbound)', 'role': 'entry', 'anpr': 1, 'url': ''},
+    {'stream': 'exit_gate', 'name': 'Exit Gate (Outbound)', 'role': 'exit', 'anpr': 1, 'url': ''},
+    {'stream': 'egtmp', 'name': 'Exit Gate to Main Porch', 'role': 'checkpoint', 'anpr': 1, 'url': ''},
+]
+MODE_STATE_FILE = ROOT / "feed_mode.json"
+CURRENT_FEED_MODE = 'live'
+if os.path.exists(MODE_STATE_FILE):
+    try:
+        with open(MODE_STATE_FILE, 'r') as fp:
+            CURRENT_FEED_MODE = json.load(fp).get('mode', 'live')
+    except Exception:
+        pass
+
+DB_PATH = DEMO_DB_PATH if CURRENT_FEED_MODE == 'demo' else LIVE_DB_PATH
 RTSP_BASE = os.environ.get('RTSP_BASE', 'rtsp://124.123.89.162:31554/live')
 OBJECTS_URLS = [u.strip() for u in os.environ.get('OBJECTS_URLS', 'http://172.17.0.1:31012,http://172.17.0.1:31013').split(',') if u.strip()]
 
@@ -244,23 +298,44 @@ class Detector:
         return ''.join(char for i, char in enumerate(text) if char != '-' and (i == 0 or char != text[i - 1]))
     def scan(self, frame):
         h, w = frame.shape[:2]
-        # ── STAGE 1: Confirm Vehicle Presence First ───────────────────
+        # ── STAGE 1: Confirm Vehicle Presence First (CUDA YOLOv8 ~4.5ms) ─
         vehicles = self.vehicle_detector.detect(frame, conf_thresh=0.28)
         if not vehicles:
             # No vehicle present in frame -> no plate can exist. Completely skips signs, watermarks & pavement.
             return [], []
-        # ── STAGE 2: Plate Detection inside Confirmed Vehicles ─────────
+
+        # ── STAGE 2: Targeted Vehicle Crop ANPR ─────────────────────────
+        # Instead of 5 blind full-screen tiles, crop strictly around detected vehicles.
+        # Prioritize largest (closest / foreground) vehicles first, max 2 vehicles per frame.
+        def vehicle_area(v):
+            vx1, vy1, vx2, vy2 = v['bbox']
+            return (vx2 - vx1) * (vy2 - vy1)
+
+        sorted_vehicles = sorted(vehicles, key=vehicle_area, reverse=True)[:2]
         mask = self.timestamp_mask(frame)
-        tiles = [
-            (0, 0, int(w * 0.55), int(h * 0.58)),
-            (int(w * 0.45), 0, w, int(h * 0.58)),
-            (0, int(h * 0.44), int(w * 0.55), h),
-            (int(w * 0.45), int(h * 0.44), w, h),
-            (int(w * 0.22), int(h * 0.25), int(w * 0.78), int(h * 0.85))
-        ]
         detections = []
         seen_quads = []
-        for x0, y0, x1, y1 in tiles:
+
+        for v in sorted_vehicles:
+            vx1, vy1, vx2, vy2 = v['bbox']
+            vw = vx2 - vx1
+            vh = vy2 - vy1
+            if vw < 50 or vh < 50:
+                continue
+
+            # Crop tightly around vehicle with 10% horizontal and 12% vertical context margin
+            pad_x = int(vw * 0.10)
+            pad_y = int(vh * 0.12)
+            x0 = max(0, vx1 - pad_x)
+            y0 = max(0, vy1 - pad_y)
+            x1 = min(w, vx2 + pad_x)
+            y1 = min(h, vy2 + pad_y)
+
+            crop_w = x1 - x0
+            crop_h = y1 - y0
+            if crop_w < 40 or crop_h < 40:
+                continue
+
             tile = frame[y0:y1, x0:x1].copy()
             tile_mask = mask[y0:y1, x0:x1]
             tile[tile_mask == 0] = 128
@@ -270,7 +345,8 @@ class Detector:
                 continue
             if boxes is None:
                 continue
-            sx, sy = (x1 - x0) / 736.0, (y1 - y0) / 736.0
+
+            sx, sy = crop_w / 736.0, crop_h / 736.0
             for box, score in zip(boxes, scores):
                 quad = np.array(box, dtype=np.float64).reshape(-1, 2)
                 quad[:, 0] = quad[:, 0] * sx + x0
@@ -280,19 +356,13 @@ class Detector:
                     continue
                 center = (x + bw / 2, y + bh / 2)
                 cx, cy = int(center[0]), int(center[1])
-                # Reject camera watermark areas (top timestamps, bottom-right camera names)
+                # Reject camera watermark areas
                 if is_watermark_zone(cx, cy, w, h):
                     continue
-                # REJECT IF NOT INSIDE A CONFIRMED VEHICLE BOUNDING BOX!
-                matching_vehicle = None
-                for v in vehicles:
-                    vx1, vy1, vx2, vy2 = v['bbox']
-                    pad_w = (vx2 - vx1) * 0.12
-                    pad_h = (vy2 - vy1) * 0.12
-                    if (vx1 - pad_w) <= cx <= (vx2 + pad_w) and (vy1 - pad_h) <= cy <= (vy2 + pad_h):
-                        matching_vehicle = v
-                        break
-                if matching_vehicle is None:
+                # Reject if outside the vehicle bounding box
+                pad_w_chk = vw * 0.15
+                pad_h_chk = vh * 0.15
+                if not ((vx1 - pad_w_chk) <= cx <= (vx2 + pad_w_chk) and (vy1 - pad_h_chk) <= cy <= (vy2 + pad_h_chk)):
                     continue
                 if any(np.hypot(center[0] - sc[0], center[1] - sc[1]) < 25 for sc in seen_quads):
                     continue
@@ -312,8 +382,8 @@ class Detector:
                     'quad': quad,
                     'bbox': [x, y, bw, bh],
                     'score': round(float(score), 3),
-                    'vehicle_bbox': matching_vehicle['bbox'],
-                    'vehicle_name': matching_vehicle['name']
+                    'vehicle_bbox': v['bbox'],
+                    'vehicle_name': v['name']
                 })
         return detections, vehicles
 class Store:
@@ -321,7 +391,7 @@ class Store:
         pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.execute('PRAGMA journal_mode=WAL')
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         with self.lock:
             self.db.executescript('''
                 CREATE TABLE IF NOT EXISTS devices(stream TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, anpr INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, url TEXT DEFAULT '', masks TEXT DEFAULT '[]', enabled INTEGER NOT NULL DEFAULT 1);
@@ -345,6 +415,14 @@ class Store:
                 self.db.commit()
             except Exception:
                 pass
+            try:
+                cur_dev = self.db.cursor()
+                cur_dev.execute("SELECT COUNT(*) FROM devices")
+                if cur_dev.fetchone()[0] == 0:
+                    for d in DEFAULT_VEHICLE_DEVICES:
+                        self.add_device(d['stream'], d['name'], d['role'], d['anpr'], d['url'])
+            except Exception as e:
+                print("Default devices seed note:", e)
     def setting(self, key, fallback=None):
         with self.lock:
             row = self.db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
@@ -535,7 +613,8 @@ class Engine:
         self.detector = None
         self.model_lock = threading.Lock()
         self.lock = threading.Condition()
-        self.workers = {}  # stream -> {latest, jpeg, sequence, seen, pending, noise, last_out, meta}
+        self.workers = {}  # stream -> {latest, jpeg, sequence, seen, pending, noise, last_out, meta, gen, running}
+        self.generation = 0
         self.obj_cursors = {}
         self.stats = {'scans': 0, 'sightings': 0, 'passages': 0, 'error': None}
         self.detector_error = None
@@ -551,13 +630,20 @@ class Engine:
     def worker(self, stream):
         with self.lock:
             if stream not in self.workers:
-                self.workers[stream] = {'latest': None, 'jpeg': None, 'sequence': 0, 'seen': {}, 'pending': {}, 'noise': {},
-                                        'last_out': 0, 'meta': {'fps': 0, 'scan_ms': 0, 'plates': 0, 'error': None}}
-                threading.Thread(target=self.capture, args=(stream,), daemon=True).start()
+                self.workers[stream] = {
+                    'gen': self.generation,
+                    'running': True,
+                    'latest': None, 'jpeg': None, 'sequence': 0, 'seen': {}, 'pending': {}, 'noise': {},
+                    'last_out': 0, 'meta': {'fps': 0, 'scan_ms': 0, 'plates': 0, 'error': None}
+                }
+                threading.Thread(target=self.capture, args=(stream, self.generation), daemon=True).start()
             return self.workers[stream]
     def drop(self, stream):
         with self.lock:
-            self.workers.pop(stream, None)
+            w = self.workers.pop(stream, None)
+            if w:
+                w['running'] = False
+            self.lock.notify_all()
     def sync(self):
         """Ensure a capture worker per ANPR-enabled device; stop removed ones."""
         wanted = {d['stream'] for d in self.store.devices() if d['anpr']}
@@ -566,43 +652,72 @@ class Engine:
         with self.lock:
             for stream in list(self.workers):
                 if stream not in wanted:
-                    self.workers.pop(stream)
-    def capture(self, stream):
+                    w = self.workers.pop(stream, None)
+                    if w:
+                        w['running'] = False
+            self.lock.notify_all()
+    def capture(self, stream, my_gen):
         fps_history = collections.deque(maxlen=30)
         while True:
             with self.lock:
-                active = stream in self.workers
-            if not active:
-                return
+                w = self.workers.get(stream)
+                if not w or w.get('gen') != my_gen or not w.get('running', True):
+                    return
             dev = next((d for d in self.store.devices() if d['stream'] == stream), None)
-            source = (dev.get('url') if dev and dev.get('url') else f'{RTSP_BASE}/{stream}')
+            if CURRENT_FEED_MODE == 'demo':
+                source = DEMO_VEHICLE_RECORDINGS.get(stream, str(RECORDINGS_DIR / "mgptz"))
+            else:
+                source = (dev.get('url') if dev and dev.get('url') else f'{RTSP_BASE}/{stream}')
+
+            playlist = get_playlist(source)
+            playlist_idx = 0
+            current_source = playlist[playlist_idx] if playlist else source
+            is_file = (playlist and len(playlist) > 0 and os.path.isfile(playlist[0])) or os.path.isfile(current_source)
+
             os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp|fflags;nobuffer|flags;low_delay'
-            cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG, [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000, cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000])
+            cap = cv2.VideoCapture(current_source, cv2.CAP_FFMPEG, [cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000, cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000])
             if not cap.isOpened():
                 with self.lock:
-                    if stream in self.workers:
+                    if stream in self.workers and self.workers[stream].get('gen') == my_gen:
                         self.workers[stream]['meta']['fps'] = 0
-                        self.workers[stream]['meta']['error'] = 'Camera connection unavailable; reconnecting'
+                        self.workers[stream]['meta']['error'] = 'Camera connection unavailable; auto-retry in 15s'
                 cap.release()
-                time.sleep(2)
+                time.sleep(15)
                 continue
             try:
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             except Exception:
                 pass
 
-            last_publish = 0.0
             consecutive_fails = 0
+            video_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            frame_delay = 1.0 / max(10.0, min(30.0, video_fps)) if is_file else 0.0
 
             while True:
+                t_frame_start = time.monotonic()
+                with self.lock:
+                    w = self.workers.get(stream)
+                    if not w or w.get('gen') != my_gen or not w.get('running', True):
+                        cap.release()
+                        return
+
                 ok, frame = cap.read()
                 if not ok:
+                    if is_file and playlist:
+                        playlist_idx = (playlist_idx + 1) % len(playlist)
+                        current_source = playlist[playlist_idx]
+                        cap.release()
+                        cap = cv2.VideoCapture(current_source, cv2.CAP_FFMPEG)
+                        time.sleep(0.02)
+                        continue
                     consecutive_fails += 1
                     if consecutive_fails > 10:
                         with self.lock:
-                            if stream in self.workers:
+                            if stream in self.workers and self.workers[stream].get('gen') == my_gen:
                                 self.workers[stream]['meta']['fps'] = 0
-                                self.workers[stream]['meta']['error'] = 'Camera connection unavailable; reconnecting'
+                                self.workers[stream]['meta']['error'] = 'Camera connection unavailable; auto-retry in 15s'
+                        cap.release()
+                        time.sleep(15)
                         break
                     time.sleep(0.05)
                     continue
@@ -610,18 +725,13 @@ class Engine:
                 consecutive_fails = 0
                 now = time.monotonic()
                 with self.lock:
-                    if stream not in self.workers:
+                    w = self.workers.get(stream)
+                    if not w or w.get('gen') != my_gen or not w.get('running', True):
                         cap.release()
                         return
-                    self.workers[stream]['latest'] = (frame, now)
-                    self.workers[stream]['meta']['error'] = None
-                    active_v, active_d = self.workers[stream].get('active_boxes', ([], []))
-
-                # Paced MJPEG streaming to smooth ~12.5 FPS (80ms interval)
-                # Prevents network buffer bloat and eliminates browser lag!
-                if now - last_publish < 0.080:
-                    continue
-                last_publish = now
+                    w['latest'] = (frame, now)
+                    w['meta']['error'] = None
+                    active_v, active_d = w.get('active_boxes', ([], []))
 
                 hud_frame = frame.copy()
                 for v in active_v:
@@ -635,7 +745,7 @@ class Engine:
                     cv2.polylines(hud_frame, [det['quad'].astype(np.int32)], True, (60, 220, 120), 2)
                     cv2.putText(hud_frame, det['plate'], (x, max(15, y - 7)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (60, 220, 120), 2, cv2.LINE_AA)
 
-                # Resize to 768x432 for optimal web streaming throughput without TCP congestion
+                # Resize to 768x432 for optimal web streaming throughput
                 if hud_frame.shape[1] > 768:
                     stream_frame = cv2.resize(hud_frame, (768, int(hud_frame.shape[0] * 768 / hud_frame.shape[1])), interpolation=cv2.INTER_LINEAR)
                 else:
@@ -647,15 +757,24 @@ class Engine:
                     cutoff = now - 1.0
                     while fps_history and fps_history[0] < cutoff:
                         fps_history.popleft()
-                    measured_fps = round(len(fps_history) / max(now - fps_history[0], 0.001), 1) if len(fps_history) > 1 else 12.5
-                    display_fps = min(max(measured_fps, 9.5), 14.0)
+                    measured_fps = round(len(fps_history) / max(now - fps_history[0], 0.001), 1) if len(fps_history) > 1 else (video_fps if is_file else 25.0)
+                    display_fps = min(max(measured_fps, 10.0), 30.0)
 
                     with self.lock:
-                        if stream in self.workers:
-                            self.workers[stream]['jpeg'] = jpeg.tobytes()
-                            self.workers[stream]['sequence'] += 1
-                            self.workers[stream]['meta']['fps'] = display_fps
+                        w = self.workers.get(stream)
+                        if w and w.get('gen') == my_gen and w.get('running', True):
+                            w['jpeg'] = jpeg.tobytes()
+                            w['sequence'] += 1
+                            w['meta']['fps'] = display_fps
                             self.lock.notify_all()
+
+                # Accurate real-time frame pacing (1.0x normal speed playback)
+                if is_file:
+                    elapsed = time.monotonic() - t_frame_start
+                    sleep_needed = frame_delay - elapsed
+                    if sleep_needed > 0:
+                        time.sleep(sleep_needed)
+
             cap.release()
             time.sleep(1.0)
     def canonical(self, worker, plate):
@@ -665,15 +784,20 @@ class Engine:
         return plate
     def infer_loop(self):
         last_frame = {}
+        last_infer_time = {}
         while True:
+            now = time.monotonic()
             with self.lock:
                 items = [(stream, w['latest'], w) for stream, w in self.workers.items()]
-            items = [(s, latest, w) for s, latest, w in items if latest and last_frame.get(s) != latest[1]]
+            # Temporal Decimation: pace inference to ~5 FPS (200ms interval) per camera
+            items = [(s, latest, w) for s, latest, w in items
+                     if latest and last_frame.get(s) != latest[1] and (now - last_infer_time.get(s, 0)) >= 0.20]
             if not items:
-                time.sleep(0.05)
+                time.sleep(0.03)
                 continue
             for stream, (original, captured), worker in items:
                 last_frame[stream] = captured
+                last_infer_time[stream] = time.monotonic()
                 detector = self.ensure_detector()
                 if detector is None:
                     time.sleep(1)
@@ -759,6 +883,53 @@ class Engine:
             workers = {s: {'jpeg': w['jpeg'] is not None, **w['meta']} for s, w in self.workers.items()}
         return {'running': True, 'model': 'PP-OCRv3 + CRNN' if self.detector else 'loading',
                 'model_error': self.detector_error, 'workers': workers, 'objects_backends': len(OBJECTS_URLS), **self.stats}
+
+    def get_feed_mode(self):
+        global CURRENT_FEED_MODE
+        return CURRENT_FEED_MODE
+
+    def set_feed_mode(self, mode=None):
+        global CURRENT_FEED_MODE, DB_PATH
+        if not mode:
+            mode = 'demo' if CURRENT_FEED_MODE == 'live' else 'live'
+        mode = 'demo' if str(mode).lower() == 'demo' else 'live'
+        
+        if mode == CURRENT_FEED_MODE:
+            return {'ok': True, 'mode': mode, 'active_db': os.path.basename(DB_PATH)}
+            
+        print(f"[VEHICLE TRACKER] Switching feed mode: {CURRENT_FEED_MODE} -> {mode}")
+        CURRENT_FEED_MODE = mode
+        
+        try:
+            with open(MODE_STATE_FILE, 'w') as f:
+                json.dump({'mode': mode}, f)
+        except Exception:
+            pass
+            
+        if mode == 'demo':
+            DB_PATH = DEMO_DB_PATH
+            new_store = Store(DEMO_DB_PATH)
+            if len(new_store.devices()) == 0:
+                for d in self.store.devices():
+                    new_store.add_device(d['stream'], d['name'], d['role'], d.get('anpr', 1), d.get('url', ''))
+            self.store = new_store
+            Handler.store = new_store
+        else:
+            DB_PATH = LIVE_DB_PATH
+            new_store = Store(LIVE_DB_PATH)
+            self.store = new_store
+            Handler.store = new_store
+
+        with self.lock:
+            self.generation += 1
+            for s, w in self.workers.items():
+                w['running'] = False
+            self.workers.clear()
+            self.lock.notify_all()
+
+        time.sleep(0.15)
+        self.sync()
+        return {'ok': True, 'mode': mode, 'active_db': os.path.basename(DB_PATH)}
 class Handler(BaseHTTPRequestHandler):
     store = None
     engine = None
@@ -806,8 +977,18 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path_str == '/health':
                 return self.send_json(200, {'ok': True})
+            if path_str in ('/feed-source', '/api/feed-source'):
+                return self.send_json(200, {
+                    'mode': self.engine.get_feed_mode(),
+                    'active_db': os.path.basename(DB_PATH)
+                })
             if path_str == '/state':
-                return self.send_json(200, {'devices': self.store.devices(), 'rules': self.store.rules(), 'engine': self.engine.state()})
+                return self.send_json(200, {
+                    'devices': self.store.devices(),
+                    'rules': self.store.rules(),
+                    'engine': self.engine.state(),
+                    'feed_mode': self.engine.get_feed_mode()
+                })
             if path_str == '/devices':
                 return self.send_json(200, {'devices': self.store.devices()})
             if path_str == '/rules':
@@ -924,6 +1105,10 @@ class Handler(BaseHTTPRequestHandler):
             match = re.match(r'^/devices/([A-Za-z0-9_-]+)/stream.mjpg$', path_str)
             if match:
                 stream = match.group(1)
+                req_mode = query.get('mode', [None])[0]
+                if req_mode and req_mode != self.engine.get_feed_mode():
+                    return self.send_json(409, {'error': f'Mode mismatch: requested {req_mode}, active is {self.engine.get_feed_mode()}'})
+
                 with self.engine.lock:
                     worker = self.engine.workers.get(stream)
                 if not worker:
@@ -940,16 +1125,21 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header('Pragma', 'no-cache')
                 self.end_headers()
                 sequence = -1
+                stream_gen = worker.get('gen', 0)
                 try:
                     while True:
+                        if req_mode and req_mode != self.engine.get_feed_mode():
+                            return
                         frame = None
                         with self.engine.lock:
                             while stream in self.engine.workers and (self.engine.workers[stream]['jpeg'] is None or self.engine.workers[stream]['sequence'] == sequence):
-                                if not self.engine.lock.wait(timeout=1.0):
+                                if not self.engine.lock.wait(timeout=0.5):
                                     break
                             if stream not in self.engine.workers:
                                 return
                             cur = self.engine.workers[stream]
+                            if cur.get('gen', 0) != stream_gen:
+                                return
                             if cur['jpeg'] is not None and cur['sequence'] != sequence:
                                 sequence = cur['sequence']
                                 frame = cur['jpeg']
@@ -990,6 +1180,10 @@ class Handler(BaseHTTPRequestHandler):
             path_str = path_str[4:] or '/'
         try:
             data = self.body()
+            if path_str in ('/feed-source', '/api/feed-source', '/feed-source/toggle', '/api/feed-source/toggle'):
+                mode = data.get('mode')
+                res = self.engine.set_feed_mode(mode)
+                return self.send_json(200, res)
             if path_str == '/devices':
                 device = self.store.add_device(
                     stream=data.get('stream', ''),
