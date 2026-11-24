@@ -29,6 +29,13 @@ ROOT = pathlib.Path(__file__).resolve().parent
 DIST_DIR = ROOT / 'dist'
 KEY = os.environ.get('VISION_SERVICE_KEY', '')
 MODELS = ROOT / '.vision-models'
+import sys
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(MODELS))
+try:
+    from lpd_yunet import LPD_YuNet
+except Exception:
+    LPD_YuNet = None
 LIVE_DB_PATH = os.environ.get('TRACKER_DB', str(ROOT / 'vehicle_tracker.db') if (os.name == 'nt' or not os.path.exists('/data')) else '/data/vehicle_tracker.db')
 DEMO_DB_PATH = '/data/vehicle_tracker_demo.db' if os.path.exists('/data') else str(ROOT / 'vehicle_tracker_demo.db')
 RECORDINGS_DIR = pathlib.Path('/data/recordings') if os.path.exists('/data/recordings') else (ROOT / 'recordings' if (ROOT / 'recordings').exists() else pathlib.Path(r"d:\Python Projects\recordings"))
@@ -109,12 +116,25 @@ MIME_TYPES = {
     '.woff': 'font/woff',
     '.woff2': 'font/woff2',
 }
-import onnxruntime as ort
+ort = None
+try:
+    if int(np.__version__.split('.')[0]) < 2:
+        import onnxruntime as ort
+except Exception:
+    ort = None
 CHARSET = '0123456789abcdefghijklmnopqrstuvwxyz'
 STRICT_RE = re.compile(r'^[a-z]{2}\d{1,2}[a-z]{1,3}\d{4}$')
-TO_DIGIT = {'o': '0', 'q': '0', 'd': '0', 'i': '1', 'l': '1', 'j': '1', 't': '7', 'z': '2', 's': '5', 'b': '8', 'g': '6', 'a': '4'}
-TO_LETTER = {'0': 'o', '1': 'i', '2': 'z', '3': 'e', '4': 'a', '5': 's', '6': 'g', '7': 't', '8': 'b'}
-INDIAN_STATES = {'hr', 'dl', 'up', 'mh', 'ka', 'pb', 'ch', 'uk', 'rj', 'mp', 'gj', 'wb', 'tn', 'kl', 'ap', 'ts', 'br', 'jh', 'od', 'as', 'ga', 'jk', 'hp', 'tr', 'nl', 'mn', 'mz', 'sk', 'bh'}
+TO_DIGIT = {'o': '0', 'q': '0', 'd': '0', 'i': '1', 'l': '1', 'j': '1', 'z': '2', 'e': '3', 'a': '4', 's': '5', 'g': '6', 't': '7', 'b': '8',
+            'O': '0', 'Q': '0', 'D': '0', 'I': '1', 'L': '1', 'J': '1', 'Z': '2', 'E': '3', 'A': '4', 'S': '5', 'G': '6', 'T': '7', 'B': '8'}
+TO_LETTER = {'0': 'O', '1': 'I', '2': 'Z', '3': 'E', '4': 'A', '5': 'S', '6': 'G', '7': 'T', '8': 'B'}
+INDIAN_STATES = {'HR', 'DL', 'UP', 'MH', 'KA', 'PB', 'CH', 'UK', 'RJ', 'MP', 'GJ', 'WB', 'TN', 'KL', 'AP', 'TS', 'BR', 'JH', 'OD', 'AS', 'GA', 'JK', 'HP', 'TR', 'NL', 'MN', 'MZ', 'SK', 'BH'}
+PRIORITY_STATES = ['HR', 'DL', 'UP', 'PB', 'CH', 'RJ', 'UK', 'MH']
+COMMON_PREFIX_FIXES = {
+    '11R': 'HR', 'IIR': 'HR', 'MR': 'HR', 'NR': 'HR', 'HB': 'HR', '1R': 'HR', 'IR': 'HR',
+    '0L': 'DL', 'D1': 'DL', 'DI': 'DL', 'OL': 'DL', 'QL': 'DL', 'CL': 'DL',
+    'VP': 'UP', 'OP': 'UP', 'LP': 'UP', '0P': 'UP', 'JP': 'UP',
+    'P8': 'PB', 'R1': 'RJ', 'C11': 'CH'
+}
 GARBAGE_WORDS = [
     'exit', 'gate', 'entry', 'main', 'medanta', 'app', 'hospital',
     'outside', 'ptz', 'egtmp', 'speed', 'slow', 'stop', 'police',
@@ -142,70 +162,82 @@ def is_watermark_zone(cx, cy, w, h):
         return True
     return False
 def clean_indian_text(raw):
-    t = re.sub(r'[^a-z0-9]', '', raw.lower())
-    if t.startswith('ind'):
+    if not raw:
+        return ""
+    t = re.sub(r'[^A-Za-z0-9]', '', raw).upper()
+    if t.startswith('IND') and len(t) >= 11:
         t = t[3:]
-    elif (t.startswith('i') or t.startswith('1')) and len(t) > 3 and t[1:3] in INDIAN_STATES:
+    elif (t.startswith('I') or t.startswith('1')) and len(t) >= 10 and t[1:3] in INDIAN_STATES:
         t = t[1:]
-    for state in INDIAN_STATES:
-        if t.startswith(state[0] + 'i' + state[1]) or t.startswith(state[0] + '1' + state[1]):
-            t = state + t[3:]
+    for pfx, fixed in COMMON_PREFIX_FIXES.items():
+        if t.startswith(pfx):
+            t = fixed + t[len(pfx):]
             break
-    if len(t) == 9 and t.startswith('r') and (t[1].isdigit() or t[1] in ('b', 'o', 's', 'z', 'e', 'a')):
-        t = 'h' + t
-    elif len(t) == 9 and t.startswith('l') and (t[1].isdigit() or t[1] in ('b', 'o', 's', 'z', 'e', 'a')):
-        t = 'd' + t
     return t
 def fix_plate(raw_text):
     if is_garbage_text(raw_text):
         return None
     text = clean_indian_text(raw_text)
-    if is_garbage_text(text):
+    if is_garbage_text(text) or len(text) < 7 or len(text) > 11:
         return None
-    if len(text) < 7 or len(text) > 11:
-        return None
-    if text[:2] not in INDIAN_STATES:
-        fixed_s = None
-        for s in INDIAN_STATES:
-            if (s[0] == text[0] or text[0] in ('0', '1', 'i', 'o')) and (s[1] == text[1] or text[1] in ('1', 'l', 'i', 'r')):
-                fixed_s = s
+
+    # First 2 chars must be State letters
+    s0 = TO_LETTER.get(text[0], text[0])
+    s1 = TO_LETTER.get(text[1], text[1])
+    state = s0 + s1
+    if state not in INDIAN_STATES:
+        found_state = None
+        for s in PRIORITY_STATES:
+            if s[0] == s0 or s[1] == s1:
+                found_state = s
                 break
-        if fixed_s:
-            text = fixed_s + text[2:]
+        if found_state:
+            state = found_state
         else:
             return None
-    tail = text[-4:]
-    fixed_tail = [ch if ch.isdigit() else TO_DIGIT.get(ch) for ch in tail]
+
+    # Last 4 characters must be digits
+    tail_chars = text[-4:]
+    fixed_tail = [ch if ch.isdigit() else TO_DIGIT.get(ch) for ch in tail_chars]
     if any(c is None for c in fixed_tail):
         return None
     fixed_tail_str = ''.join(fixed_tail)
+
     mid = text[2:-4]
     if not mid:
         return None
-    if len(mid) >= 2 and mid[0].isdigit() and mid[1].isalpha():
-        rto_lens = (1, 2)
-    elif len(mid) >= 2 and mid[0].isdigit() and mid[1].isdigit():
-        rto_lens = (2, 1)
+
+    # Determine RTO digits and Series letters
+    rto = []
+    if state == 'DL':
+        rto.append(mid[0] if mid[0].isdigit() else TO_DIGIT.get(mid[0], '1'))
+        start_idx = 1
+        if len(mid) >= 2 and (mid[1].isdigit() or (mid[1] in TO_DIGIT and len(mid) >= 3 and mid[2].isalpha())):
+            rto.append(mid[1] if mid[1].isdigit() else TO_DIGIT.get(mid[1], '0'))
+            start_idx = 2
     else:
-        rto_lens = (2, 1)
-    for rto_len in rto_lens:
-        if len(mid) < rto_len:
-            continue
-        rto_digits = [ch if ch.isdigit() else TO_DIGIT.get(ch) for ch in mid[:rto_len]]
-        if any(c is None for c in rto_digits):
-            continue
-        series_letters = [ch if ch.isalpha() else TO_LETTER.get(ch) for ch in mid[rto_len:]]
-        if any(c is None for c in series_letters):
-            continue
-        candidate = text[:2].upper() + ''.join(rto_digits) + ''.join(series_letters).upper() + fixed_tail_str
-        if 8 <= len(candidate) <= 10:
-            return candidate
+        d1 = mid[0] if mid[0].isdigit() else TO_DIGIT.get(mid[0], '2')
+        rto.append(d1)
+        start_idx = 1
+        if len(mid) >= 2:
+            d2 = mid[1] if mid[1].isdigit() else TO_DIGIT.get(mid[1], '6')
+            rto.append(d2)
+            start_idx = 2
+
+    series = [ch if ch.isalpha() else TO_LETTER.get(ch, 'A') for ch in mid[start_idx:]]
+    candidate = state + ''.join(rto) + ''.join(series) + fixed_tail_str
+    if 8 <= len(candidate) <= 10:
+        return candidate
     return None
 cv2.setNumThreads(4)
 class VehicleDetector:
-    """YOLOv8n detector on CUDA Execution Provider (~4.5ms) for confirming vehicles."""
+    """YOLO vehicle & license plate detector with dual-engine (ONNXRuntime / OpenCV-DNN)
+    and automatic custom model detection (vehicle.onnx vs yolov8n.onnx)."""
     def __init__(self):
         candidate_paths = [
+            ROOT / 'vehicle.onnx',
+            pathlib.Path('/app/vehicle.onnx'),
+            MODELS / 'vehicle.onnx',
             pathlib.Path('/app/yolov8n.onnx'),
             ROOT / 'yolov8n.onnx',
             MODELS / 'yolov8n.onnx',
@@ -213,34 +245,80 @@ class VehicleDetector:
         ]
         model_path = next((p for p in candidate_paths if p.is_file()), None)
         if not model_path:
-            raise FileNotFoundError("yolov8n.onnx model not found for vehicle detection")
-        opts = ort.SessionOptions()
-        opts.log_severity_level = 3
-        self.sess = ort.InferenceSession(str(model_path), opts, providers=["CUDAExecutionProvider"])
-        self.input_name = self.sess.get_inputs()[0].name
-        self.output_name = self.sess.get_outputs()[0].name
-        dummy = np.zeros((1, 3, 640, 640), dtype=np.float32)
-        for _ in range(2):
-            self.sess.run([self.output_name], {self.input_name: dummy})
-        self.cls_names = {2: 'car', 3: 'motorcycle', 5: 'bus', 7: 'truck'}
-    def detect(self, frame, conf_thresh=0.28):
+            raise FileNotFoundError("No vehicle model found (checked vehicle.onnx and yolov8n.onnx)")
+        self.model_path = model_path
+        self.use_ort = False
+        self.sess = None
+        self.net = None
+
+        if ort is not None:
+            try:
+                opts = ort.SessionOptions()
+                opts.log_severity_level = 3
+                avail = ort.get_available_providers()
+                providers = [p for p in ["CUDAExecutionProvider", "CPUExecutionProvider"] if p in avail]
+                self.sess = ort.InferenceSession(str(model_path), opts, providers=providers)
+                self.input_name = self.sess.get_inputs()[0].name
+                self.output_name = self.sess.get_outputs()[0].name
+                dummy = np.zeros((1, 3, 640, 640), dtype=np.float32)
+                for _ in range(2):
+                    self.sess.run([self.output_name], {self.input_name: dummy})
+                self.use_ort = True
+            except Exception:
+                self.use_ort = False
+
+        if not self.use_ort:
+            self.net = cv2.dnn.readNet(str(model_path))
+            self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+
+        # Detect model type:
+        # Custom 5-class model: 0: car, 1: no_plate, 2: auto, 3: bike, 4: ambulance
+        # COCO 80-class fallback: 2: car, 3: motorcycle, 5: bus, 7: truck
+        self.is_custom = ('vehicle' in model_path.name.lower() and 'yolov8n' not in model_path.name.lower())
+        if self.is_custom:
+            self.cls_names = {0: 'car', 1: 'no_plate', 2: 'auto', 3: 'bike', 4: 'ambulance'}
+            self.v_cls = [0, 1, 2, 3, 4]
+        else:
+            self.cls_names = {2: 'car', 3: 'motorcycle', 5: 'bus', 7: 'truck'}
+            self.v_cls = [2, 3, 5, 7]
+
+        print(f"[VehicleDetector] Successfully loaded: {model_path.name} (Engine: {'ONNXRuntime' if self.use_ort else 'OpenCV-DNN'})")
+
+    def detect(self, frame, conf_thresh=0.25):
         h, w = frame.shape[:2]
-        img = cv2.resize(frame, (640, 640)).astype(np.float32) / 255.0
-        img = np.transpose(img, (2, 0, 1))[None, ...]
-        preds = self.sess.run([self.output_name], {self.input_name: img})[0]
-        out = preds[0].T
+        if self.use_ort:
+            img = cv2.resize(frame, (640, 640)).astype(np.float32) / 255.0
+            img = np.transpose(img, (2, 0, 1))[None, ...]
+            preds = self.sess.run([self.output_name], {self.input_name: img})[0]
+            out = preds[0].T
+        else:
+            blob = cv2.dnn.blobFromImage(frame, 1/255.0, (640, 640), swapRB=True, crop=False)
+            self.net.setInput(blob)
+            preds = self.net.forward()
+            out = preds[0].T
+
         boxes = out[:, :4]
         scores = out[:, 4:]
-        v_cls = [2, 3, 5, 7]
+
+        v_cls = self.v_cls
+        if scores.shape[1] == 5 and not self.is_custom:
+            v_cls = [0, 1, 2, 3, 4]
+            self.cls_names = {0: 'car', 1: 'no_plate', 2: 'auto', 3: 'bike', 4: 'ambulance'}
+        elif scores.shape[1] > 10 and self.is_custom:
+            v_cls = [2, 3, 5, 7]
+            self.cls_names = {2: 'car', 3: 'motorcycle', 5: 'bus', 7: 'truck'}
+
         max_scores = np.max(scores[:, v_cls], axis=1)
         cls_idx = np.argmax(scores[:, v_cls], axis=1)
         mask = max_scores >= conf_thresh
         if not np.any(mask):
             return []
+
         v_boxes = boxes[mask]
         v_scores = max_scores[mask]
         v_cls_chosen = [v_cls[i] for i in cls_idx[mask]]
         scale_x, scale_y = w / 640.0, h / 640.0
+
         candidate_boxes = []
         scores_list = []
         for b, s, c in zip(v_boxes, v_scores, v_cls_chosen):
@@ -251,6 +329,7 @@ class VehicleDetector:
             y2 = min(h, int((cy + bh / 2) * scale_y))
             candidate_boxes.append([x1, y1, x2 - x1, y2 - y1])
             scores_list.append(float(s))
+
         indices = cv2.dnn.NMSBoxes(candidate_boxes, scores_list, conf_thresh, 0.45)
         results = []
         for i in indices:
@@ -265,56 +344,180 @@ class VehicleDetector:
             })
         return results
 class Detector:
-    """Two-stage Vehicle-First ANPR Detector:
-       Stage 1: YOLOv8n GPU confirms vehicles (car, motorcycle, bus, truck) in ~4.5ms.
-       Stage 2: PP-OCRv3 DBNet + CRNN detects & recognizes plate text strictly inside confirmed vehicles."""
+    """Multi-stage Hybrid ANPR Pipeline:
+       Stage 1: YOLOv8 confirms vehicle presence.
+       Stage 2A: Direct plates from custom YOLO vehicle model (class 'no_plate').
+       Stage 2B: Dedicated YuNet License Plate Detector (LPD) with 4-corner perspective unwarping.
+       Stage 2C: DBNet text region fallback if YuNet has low confidence.
+       Stage 3: High-resolution PP-OCRv4 recognition with 2-line stacked plate support & character normalization."""
     def __init__(self):
         self.vehicle_detector = VehicleDetector()
+
+        # 1. DBNet text detector (fallback)
         self.detector = cv2.dnn_TextDetectionModel_DB(cv2.dnn.readNet(str(MODELS / 'text_detection_en_ppocrv3_2023may.onnx')))
-        self.detector.setBinaryThreshold(0.3)
-        self.detector.setPolygonThreshold(0.45)
+        self.detector.setBinaryThreshold(0.25)
+        self.detector.setPolygonThreshold(0.40)
         self.detector.setUnclipRatio(1.8)
         self.detector.setMaxCandidates(200)
         self.detector.setInputSize((736, 736))
         self.detector.setInputMean((123.675, 116.28, 103.53))
         self.detector.setInputScale(1.0 / 255.0 / np.array([0.229, 0.224, 0.225]))
-        self.recognizer = cv2.dnn.readNet(str(MODELS / 'text_recognition_CRNN_EN_2023feb_fp16.onnx'))
+
+        # 2. Dedicated YuNet License Plate Detector
+        yunet_path = MODELS / 'license_plate_detection_lpd_yunet_2023mar.onnx'
+        self.plate_detector = None
+        if LPD_YuNet is not None and yunet_path.is_file():
+            try:
+                self.plate_detector = LPD_YuNet(modelPath=str(yunet_path), inputSize=[320, 240], confThreshold=0.22)
+                print("[Detector] Successfully loaded YuNet License Plate Detector")
+            except Exception as e:
+                print(f"[Detector] YuNet init notice: {e}")
+
+        # 3. High-Accuracy PP-OCRv4 Character Recognizer
+        ppocr_path = MODELS / 'en_PP-OCRv4_rec.onnx'
+        dict_path = MODELS / 'en_dict.txt'
+        self.use_ppocrv4 = False
+        if ppocr_path.is_file() and dict_path.is_file():
+            try:
+                with open(dict_path, 'r', encoding='utf-8') as f:
+                    lines = [line.strip('\r\n') for line in f.readlines()]
+                self.ppocr_chars = ['blank'] + lines + [' ']
+                self.recognizer_v4 = cv2.dnn.readNet(str(ppocr_path))
+                self.use_ppocrv4 = True
+                print("[Detector] Successfully loaded PP-OCRv4 recognition engine (SVTR-LCNet)")
+            except Exception as e:
+                print(f"[Detector] PP-OCRv4 load error: {e}")
+
+        # Fallback CRNN recognizer
+        crnn_path = MODELS / 'text_recognition_CRNN_EN_2023feb_fp16.onnx'
+        self.recognizer_crnn = cv2.dnn.readNet(str(crnn_path)) if crnn_path.is_file() else None
+
     @staticmethod
     def timestamp_mask(frame):
         mask = np.zeros(frame.shape[:2], dtype=np.uint8) + 255
         mask[:int(frame.shape[0] * 0.12), :] = 0
         return mask
+
+    def _decode_ppocr(self, out):
+        preds = out[0]
+        text, confs = [], []
+        last_idx = 0
+        for t in range(preds.shape[0]):
+            idx = int(np.argmax(preds[t]))
+            score = float(preds[t, idx])
+            if idx != 0 and idx != last_idx:
+                text.append(self.ppocr_chars[idx])
+                confs.append(score)
+            last_idx = idx
+        avg_conf = float(np.mean(confs)) if confs else 0.0
+        return ''.join(text).upper().replace(' ', ''), avg_conf
+
     def ocr(self, image, quad):
-        dst = np.array([[0, 31], [0, 0], [99, 0], [99, 31]], dtype=np.float32)
-        matrix = cv2.getPerspectiveTransform(quad.astype(np.float32), dst)
-        crop = cv2.warpPerspective(image, matrix, (100, 32))
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        self.recognizer.setInput(cv2.dnn.blobFromImage(gray, size=(100, 32), mean=127.5, scalefactor=1 / 127.5))
-        out = self.recognizer.forward()
-        text = ''
-        for index in range(out.shape[0]):
-            best = int(np.argmax(out[index][0]))
-            text += '-' if best == 0 else CHARSET[best - 1]
-        return ''.join(char for i, char in enumerate(text) if char != '-' and (i == 0 or char != text[i - 1]))
+        pts = quad.astype(np.float32).reshape(4, 2)
+        w1 = np.linalg.norm(pts[1] - pts[0])
+        w2 = np.linalg.norm(pts[2] - pts[3])
+        h1 = np.linalg.norm(pts[3] - pts[0])
+        h2 = np.linalg.norm(pts[2] - pts[1])
+        pw = max(int(max(w1, w2)), 20)
+        ph = max(int(max(h1, h2)), 10)
+
+        dst = np.array([[0, 0], [pw - 1, 0], [pw - 1, ph - 1], [0, ph - 1]], dtype=np.float32)
+        matrix = cv2.getPerspectiveTransform(pts, dst)
+        crop = cv2.warpPerspective(image, matrix, (pw, ph))
+        if crop is None or crop.size == 0:
+            return ""
+
+        if self.use_ppocrv4:
+            aspect = pw / max(ph, 1)
+            # 2-line plate handling (aspect ratio <= 2.2 and sufficient height)
+            if aspect <= 2.2 and ph >= 26:
+                mid_y = int(ph * 0.52)
+                top = crop[:mid_y, :]
+                bot = crop[mid_y:, :]
+
+                top_res = cv2.resize(top, (320, 48))
+                blob_top = cv2.dnn.blobFromImage(top_res, 1.0/127.5, (320, 48), (127.5, 127.5, 127.5), swapRB=True)
+                self.recognizer_v4.setInput(blob_top)
+                txt_top, _ = self._decode_ppocr(self.recognizer_v4.forward())
+
+                bot_res = cv2.resize(bot, (320, 48))
+                blob_bot = cv2.dnn.blobFromImage(bot_res, 1.0/127.5, (320, 48), (127.5, 127.5, 127.5), swapRB=True)
+                self.recognizer_v4.setInput(blob_bot)
+                txt_bot, _ = self._decode_ppocr(self.recognizer_v4.forward())
+                return txt_top + txt_bot
+            else:
+                resized = cv2.resize(crop, (320, 48))
+                blob = cv2.dnn.blobFromImage(resized, 1.0/127.5, (320, 48), (127.5, 127.5, 127.5), swapRB=True)
+                self.recognizer_v4.setInput(blob)
+                text, _ = self._decode_ppocr(self.recognizer_v4.forward())
+                return text
+        elif self.recognizer_crnn is not None:
+            gray = cv2.cvtColor(cv2.resize(crop, (100, 32)), cv2.COLOR_BGR2GRAY)
+            self.recognizer_crnn.setInput(cv2.dnn.blobFromImage(gray, size=(100, 32), mean=127.5, scalefactor=1 / 127.5))
+            out = self.recognizer_crnn.forward()
+            text = ''
+            for index in range(out.shape[0]):
+                best = int(np.argmax(out[index][0]))
+                text += '-' if best == 0 else CHARSET[best - 1]
+            return ''.join(char for i, char in enumerate(text) if char != '-' and (i == 0 or char != text[i - 1]))
+        return ""
+
     def scan(self, frame):
         h, w = frame.shape[:2]
         # ── STAGE 1: Confirm Vehicle Presence First (CUDA YOLOv8 ~4.5ms) ─
-        vehicles = self.vehicle_detector.detect(frame, conf_thresh=0.28)
-        if not vehicles:
-            # No vehicle present in frame -> no plate can exist. Completely skips signs, watermarks & pavement.
+        raw_detections = self.vehicle_detector.detect(frame, conf_thresh=0.25)
+        if not raw_detections:
             return [], []
 
-        # ── STAGE 2: Targeted Vehicle Crop ANPR ─────────────────────────
-        # Instead of 5 blind full-screen tiles, crop strictly around detected vehicles.
-        # Prioritize largest (closest / foreground) vehicles first, max 2 vehicles per frame.
+        vehicles = [d for d in raw_detections if d['name'] != 'no_plate']
+        direct_plates = [d for d in raw_detections if d['name'] == 'no_plate']
+        if not vehicles and not direct_plates:
+            return [], []
+
+        mask = self.timestamp_mask(frame)
+        detections = []
+        seen_quads = []
+
+        # ── STAGE 1B: Direct License Plate Extraction (from custom vehicle.onnx) ──
+        for p in direct_plates:
+            px1, py1, px2, py2 = p['bbox']
+            bw = px2 - px1
+            bh = py2 - py1
+            if bw < 20 or bh < 8 or bw > 600 or bh > 200:
+                continue
+            center = (px1 + bw / 2, py1 + bh / 2)
+            cx, cy = int(center[0]), int(center[1])
+            if is_watermark_zone(cx, cy, w, h):
+                continue
+            matching_v = None
+            for v in vehicles:
+                vx1, vy1, vx2, vy2 = v['bbox']
+                if (vx1 - 25) <= cx <= (vx2 + 25) and (vy1 - 25) <= cy <= (vy2 + 25):
+                    matching_v = v
+                    break
+            quad = np.array([[px1, py1], [px2, py1], [px2, py2], [px1, py2]], dtype=np.float64)
+            raw_text = self.ocr(frame, quad)
+            if not raw_text or len(raw_text) < 4 or is_garbage_text(raw_text):
+                continue
+            normalized = fix_plate(raw_text)
+            if not normalized:
+                continue
+            seen_quads.append(center)
+            detections.append({
+                'plate': normalized.upper(),
+                'quad': quad,
+                'bbox': [px1, py1, bw, bh],
+                'score': round(float(p['score']), 3),
+                'vehicle_bbox': matching_v['bbox'] if matching_v else p['bbox'],
+                'vehicle_name': matching_v['name'] if matching_v else 'vehicle'
+            })
+
+        # ── STAGE 2: Targeted Vehicle Crop ANPR (YuNet LPD + DBNet Fallback) ──
         def vehicle_area(v):
             vx1, vy1, vx2, vy2 = v['bbox']
             return (vx2 - vx1) * (vy2 - vy1)
 
         sorted_vehicles = sorted(vehicles, key=vehicle_area, reverse=True)[:2]
-        mask = self.timestamp_mask(frame)
-        detections = []
-        seen_quads = []
 
         for v in sorted_vehicles:
             vx1, vy1, vx2, vy2 = v['bbox']
@@ -323,7 +526,6 @@ class Detector:
             if vw < 50 or vh < 50:
                 continue
 
-            # Crop tightly around vehicle with 10% horizontal and 12% vertical context margin
             pad_x = int(vw * 0.10)
             pad_y = int(vh * 0.12)
             x0 = max(0, vx1 - pad_x)
@@ -339,52 +541,89 @@ class Detector:
             tile = frame[y0:y1, x0:x1].copy()
             tile_mask = mask[y0:y1, x0:x1]
             tile[tile_mask == 0] = 128
-            try:
-                boxes, scores = self.detector.detect(cv2.resize(tile, (736, 736)))
-            except Exception:
-                continue
-            if boxes is None:
-                continue
 
-            sx, sy = crop_w / 736.0, crop_h / 736.0
-            for box, score in zip(boxes, scores):
-                quad = np.array(box, dtype=np.float64).reshape(-1, 2)
-                quad[:, 0] = quad[:, 0] * sx + x0
-                quad[:, 1] = quad[:, 1] * sy + y0
-                x, y, bw, bh = cv2.boundingRect(quad.astype(np.int32))
-                if bw < 25 or bh < 8 or bw > 600 or bh > 180 or bw / max(bh, 1) < 1.3 or bw / max(bh, 1) > 9:
+            vehicle_plate_found = False
+
+            # Step 2A: Dedicated YuNet License Plate Detector
+            if self.plate_detector is not None:
+                try:
+                    self.plate_detector.setInputSize([320, 240])
+                    res_yunet = self.plate_detector.infer(cv2.resize(tile, (320, 240)))
+                    for yr in res_yunet:
+                        pts_320 = yr[:8].reshape(4, 2)
+                        yscore = float(yr[8])
+                        pts_tile = pts_320.copy()
+                        pts_tile[:, 0] = pts_tile[:, 0] * (crop_w / 320.0) + x0
+                        pts_tile[:, 1] = pts_tile[:, 1] * (crop_h / 240.0) + y0
+
+                        center = pts_tile.mean(axis=0)
+                        cx, cy = int(center[0]), int(center[1])
+                        if is_watermark_zone(cx, cy, w, h):
+                            continue
+                        if any(np.hypot(center[0] - sc[0], center[1] - sc[1]) < 25 for sc in seen_quads):
+                            continue
+
+                        raw_text = self.ocr(frame, pts_tile)
+                        normalized = fix_plate(raw_text)
+                        if normalized:
+                            seen_quads.append(center)
+                            x_b, y_b, w_b, h_b = cv2.boundingRect(pts_tile.astype(np.int32))
+                            detections.append({
+                                'plate': normalized.upper(),
+                                'quad': pts_tile,
+                                'bbox': [x_b, y_b, w_b, h_b],
+                                'score': round(yscore, 3),
+                                'vehicle_bbox': v['bbox'],
+                                'vehicle_name': v['name']
+                            })
+                            vehicle_plate_found = True
+                except Exception:
+                    pass
+
+            # Step 2B: Fallback to DBNet if YuNet didn't find plate
+            if not vehicle_plate_found:
+                try:
+                    boxes, scores = self.detector.detect(cv2.resize(tile, (736, 736)))
+                except Exception:
                     continue
-                center = (x + bw / 2, y + bh / 2)
-                cx, cy = int(center[0]), int(center[1])
-                # Reject camera watermark areas
-                if is_watermark_zone(cx, cy, w, h):
+                if boxes is None:
                     continue
-                # Reject if outside the vehicle bounding box
-                pad_w_chk = vw * 0.15
-                pad_h_chk = vh * 0.15
-                if not ((vx1 - pad_w_chk) <= cx <= (vx2 + pad_w_chk) and (vy1 - pad_h_chk) <= cy <= (vy2 + pad_h_chk)):
-                    continue
-                if any(np.hypot(center[0] - sc[0], center[1] - sc[1]) < 25 for sc in seen_quads):
-                    continue
-                if cy < mask.shape[0] and cx < mask.shape[1] and mask[cy, cx] == 0:
-                    continue
-                raw_text = self.ocr(frame, quad)
-                if not raw_text or len(raw_text) < 4:
-                    continue
-                if is_garbage_text(raw_text):
-                    continue
-                normalized = fix_plate(raw_text)
-                if not normalized:
-                    continue
-                seen_quads.append(center)
-                detections.append({
-                    'plate': normalized.upper(),
-                    'quad': quad,
-                    'bbox': [x, y, bw, bh],
-                    'score': round(float(score), 3),
-                    'vehicle_bbox': v['bbox'],
-                    'vehicle_name': v['name']
-                })
+
+                sx, sy = crop_w / 736.0, crop_h / 736.0
+                for box, score in zip(boxes, scores):
+                    quad = np.array(box, dtype=np.float64).reshape(-1, 2)
+                    quad[:, 0] = quad[:, 0] * sx + x0
+                    quad[:, 1] = quad[:, 1] * sy + y0
+                    x, y, bw, bh = cv2.boundingRect(quad.astype(np.int32))
+                    if bw < 25 or bh < 8 or bw > 600 or bh > 180 or bw / max(bh, 1) < 1.3 or bw / max(bh, 1) > 9:
+                        continue
+                    center = (x + bw / 2, y + bh / 2)
+                    cx, cy = int(center[0]), int(center[1])
+                    if is_watermark_zone(cx, cy, w, h):
+                        continue
+                    pad_w_chk = vw * 0.15
+                    pad_h_chk = vh * 0.15
+                    if not ((vx1 - pad_w_chk) <= cx <= (vx2 + pad_w_chk) and (vy1 - pad_h_chk) <= cy <= (vy2 + pad_h_chk)):
+                        continue
+                    if any(np.hypot(center[0] - sc[0], center[1] - sc[1]) < 25 for sc in seen_quads):
+                        continue
+                    if cy < mask.shape[0] and cx < mask.shape[1] and mask[cy, cx] == 0:
+                        continue
+                    raw_text = self.ocr(frame, quad)
+                    if not raw_text or len(raw_text) < 4 or is_garbage_text(raw_text):
+                        continue
+                    normalized = fix_plate(raw_text)
+                    if not normalized:
+                        continue
+                    seen_quads.append(center)
+                    detections.append({
+                        'plate': normalized.upper(),
+                        'quad': quad,
+                        'bbox': [x, y, bw, bh],
+                        'score': round(float(score), 3),
+                        'vehicle_bbox': v['bbox'],
+                        'vehicle_name': v['name']
+                    })
         return detections, vehicles
 class Store:
     def __init__(self, path):
@@ -777,10 +1016,13 @@ class Engine:
 
             cap.release()
             time.sleep(1.0)
-    def canonical(self, worker, plate):
-        for other in list(worker['seen']) + list(worker['pending']):
+    def canonical(self, worker, plate, score=0.85):
+        for other, item in worker['pending'].items():
             if len(other) == len(plate) and sum(a != b for a, b in zip(other, plate)) <= 2:
-                return other
+                cands = item.setdefault('candidates', {})
+                cands[plate] = cands.get(plate, 0.0) + score
+                consensus = max(cands.items(), key=lambda x: x[1])[0]
+                return consensus
         return plate
     def infer_loop(self):
         last_frame = {}
@@ -822,7 +1064,7 @@ class Engine:
                         worker['seen'] = {p: ts for p, ts in worker['seen'].items() if now - ts < 45}
                         worker['pending'] = {p: i for p, i in worker['pending'].items() if now - i['last'] < 20}
                         for det in detections:
-                            det['plate'] = self.canonical(worker, det['plate'])
+                            det['plate'] = self.canonical(worker, det['plate'], det['score'])
                             x, y, w, h = det['bbox']
                             cv2.polylines(frame, [det['quad'].astype(np.int32)], True, (60, 220, 120), 2)
                             cv2.putText(frame, det['plate'], (x, max(15, y - 7)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (60, 220, 120), 2, cv2.LINE_AA)
@@ -830,10 +1072,10 @@ class Engine:
                                 continue
                             center = det['quad'].mean(axis=0)
                             previous = worker['pending'].get(det['plate'])
-                            moved = previous is None or float(np.linalg.norm(center - previous['center'])) > 20
                             sightings = (previous['count'] if previous else 0) + 1
-                            worker['pending'][det['plate']] = {'count': sightings, 'center': center, 'last': now}
-                            if sightings < 2 and det['score'] < 0.85:
+                            cands = (previous.get('candidates') if previous else {}) or {det['plate']: det['score']}
+                            worker['pending'][det['plate']] = {'count': sightings, 'center': center, 'last': now, 'candidates': cands}
+                            if sightings < 2 and det['score'] < 0.80:
                                 continue
                             worker['seen'][det['plate']] = now
 
