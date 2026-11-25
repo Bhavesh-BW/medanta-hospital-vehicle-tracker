@@ -412,40 +412,49 @@ select {
 
 .devices {
   display: grid;
-  gap: 8px
+  gap: 8px;
+  max-height: 350px;
+  overflow-y: auto;
+  padding-right: 4px
 }
 
 .device {
   display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 11px 13px;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
   border: 1px solid #eef2f7;
   border-radius: 11px;
   background: #fbfcfe
 }
 
 .device .cam {
-  width: 34px;
-  height: 34px;
+  width: 32px;
+  height: 32px;
   border-radius: 9px;
   background: linear-gradient(135deg, var(--primary-400), var(--primary-600));
   color: #fff;
   display: grid;
   place-items: center;
-  font-size: 15px;
-  flex: none
+  font-size: 14px;
+  flex: none;
+  margin-top: 2px
 }
 
 .device .info {
   flex: 1;
-  min-width: 0
+  min-width: 0;
+  display: grid;
+  gap: 4px
 }
 
 .device .info b {
   display: block;
   font-size: 12px;
-  color: #26334a
+  color: #26334a;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis
 }
 
 .device .info small {
@@ -966,6 +975,7 @@ table.tbl {
   transform: scale(1.06);
   box-shadow: 0 4px 12px rgba(0, 0, 0, .18)
 }
+
 /* ── Security Gate Vehicle Count Matrix ── */
 .vc-matrix{width:100%;border-collapse:collapse;font-size:11px;margin-top:8px}
 .vc-matrix th{text-align:left;font-size:9px;text-transform:uppercase;letter-spacing:.4px;font-weight:800;color:#8ca0bc;padding:6px 8px;border-bottom:1px solid #eef2f7}
@@ -978,6 +988,7 @@ table.tbl {
 .vc-pill.net-pos{background:#fef9c3;color:#854d0e}
 .vc-pill.net-zero{background:#f1f5f9;color:#475569}
 .vc-live-row{padding:10px 12px;border:1px solid #e7ecf4;border-radius:10px;background:#fbfcfe;display:grid;gap:7px}
+.vc-live-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px}
 .vc-mini-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
 .vc-mini-chip{background:#fff;border:1px solid #e7ecf4;border-radius:7px;padding:5px 6px;text-align:center}
 .vc-mini-chip span{display:block;font-size:9px;color:#7c8fa8;font-weight:700}

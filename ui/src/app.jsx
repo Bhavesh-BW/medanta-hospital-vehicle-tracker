@@ -660,41 +660,47 @@ function RegisteredCameras({ devices, activeSlots, onToggleViewSlot, onEditCamer
             <div key={d.stream} className={`device ${d.anpr ? 'live-dot' : ''}`}>
               <div className="cam">📹</div>
               <div className="info">
-                <b>{d.name}</b>
-                <small style={{ fontSize: 9, color: '#8ca0bc', wordBreak: 'break-all' }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6, minWidth: 0 }}>
+                  <b title={d.name}>{d.name}</b>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 4, flex: 'none' }}>
+                    <button
+                      className="btn sm"
+                      onClick={() => onToggleViewSlot(d.stream)}
+                      style={{
+                        fontSize: 10,
+                        padding: '3px 8px',
+                        background: inView ? '#f0f4f8' : '#e3f6ef',
+                        color: inView ? '#5d7089' : '#17835c',
+                        borderColor: inView ? '#dfe6f0' : '#bfe6d4'
+                      }}
+                    >
+                      {inView ? 'Hide' : 'Show'}
+                    </button>
+                    <button className="btn sm" style={{ padding: '3px 7px' }} onClick={() => onEditCamera(d)}>✏️</button>
+                  </div>
+                </div>
+                <small style={{ fontSize: 9, color: '#8ca0bc', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', display: 'block' }} title={d.url || d.stream}>
                   {d.url || d.stream}
                 </small>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap', marginTop: 1 }}>
+                  <span className={`badge ${d.role}`} style={{ fontSize: 8 }}>{d.role}</span>
+                  {(d.role === 'entry' || d.role === 'exit') && d.gate_group && (
+                    <span className="badge" style={{ background: '#e0e7ff', color: '#3730a3', fontSize: 8 }} title={`Gate Group: ${d.gate_group}`}>
+                      {d.gate_group}
+                    </span>
+                  )}
+                  {(d.role === 'entry' || d.role === 'exit') && d.count_enabled === false && (
+                    <span className="badge" style={{ background: '#fef3c7', color: '#92400e', fontSize: 8 }} title="Excluded from Gate DB counts (Live-Only)">
+                      Live Only
+                    </span>
+                  )}
+                  {inView && (
+                    <span className="badge" style={{ background: 'var(--primary-100)', color: 'var(--primary-600)', fontSize: 8 }}>
+                      Slot {slotIdx + 1}
+                    </span>
+                  )}
+                </div>
               </div>
-              <span className={`badge ${d.role}`} style={{ fontSize: 8 }}>{d.role}</span>
-              {(d.role === 'entry' || d.role === 'exit') && d.gate_group && (
-                <span className="badge" style={{ background: '#e0e7ff', color: '#3730a3', fontSize: 8 }} title={`Gate Group: ${d.gate_group}`}>
-                  {d.gate_group}
-                </span>
-              )}
-              {(d.role === 'entry' || d.role === 'exit') && d.count_enabled === false && (
-                <span className="badge" style={{ background: '#fef3c7', color: '#92400e', fontSize: 8 }} title="Excluded from Gate DB counts (Live-Only)">
-                  Live Only
-                </span>
-              )}
-              {inView && (
-                <span className="badge" style={{ background: 'var(--primary-100)', color: 'var(--primary-600)', fontSize: 8 }}>
-                  Slot {slotIdx + 1}
-                </span>
-              )}
-              <button
-                className="btn sm"
-                onClick={() => onToggleViewSlot(d.stream)}
-                style={{
-                  fontSize: 10,
-                  padding: '4px 8px',
-                  background: inView ? '#f0f4f8' : '#e3f6ef',
-                  color: inView ? '#5d7089' : '#17835c',
-                  borderColor: inView ? '#dfe6f0' : '#bfe6d4'
-                }}
-              >
-                {inView ? 'Hide' : 'Show'}
-              </button>
-              <button className="btn sm" onClick={() => onEditCamera(d)}>✏️</button>
             </div>
           );
         })}
@@ -891,7 +897,7 @@ function GateAnalyticsCard({ analytics, devices, timeFilter, setTimeFilter }) {
   }, [timeFilter, timelineMode]);
 
   return (
-    <div className="card" style={{ marginBottom: 16 }}>
+    <div className="card">
       {/* Head */}
       <div className="head" style={{ padding: '14px 18px', flexWrap: 'wrap', gap: 10 }}>
         <div>
@@ -1393,63 +1399,71 @@ function SecurityVehicleCountsCard({
           </div>
         </div>
       </div>
+    </>
+  );
+}
 
-      {/* 2. Remaining Cameras — Live Only (Never Saved to DB) */}
-      <div className="card">
-        <div className="head" style={{ flexWrap: 'wrap', gap: 8 }}>
-          <div>
-            <h3>📡 Other Cameras (Live Only)</h3>
-            <small>Checkpoint &amp; internal live detections</small>
-          </div>
-        </div>
-        <div className="body" style={{ padding: '12px 16px', display: 'grid', gap: 10 }}>
-          {remaining.map(cam => {
-            const inf = cam.in_frame || { car: 0, bike: 0, auto: 0, ambulance: 0, total: 0 };
-            const sess = cam.session || { car: 0, bike: 0, auto: 0, ambulance: 0, total: 0 };
-            return (
-              <div key={cam.stream} className="vc-live-row">
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
-                    <span
-                      style={{
-                        width: 8, height: 8, borderRadius: '50%', flex: 'none',
-                        background: cam.online ? '#10b981' : '#94a3b8',
-                        boxShadow: cam.online ? '0 0 0 3px rgba(16,185,129,0.2)' : 'none'
-                      }}
-                    />
-                    <b style={{ fontSize: 12, color: '#1e293b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                      {cam.name}
-                    </b>
-                    <span className={`badge ${cam.role}`} style={{ fontSize: 8 }}>{cam.role}</span>
-                    {(cam.role === 'entry' || cam.role === 'exit') && cam.count_enabled === false && (
-                      <span className="badge" style={{ background: '#fef3c7', color: '#92400e', fontSize: 8 }}>DB Off</span>
-                    )}
-                  </div>
-                  <span style={{ fontSize: 10, fontWeight: 700, color: cam.online ? '#059669' : '#94a3b8' }}>
-                    {cam.online ? `${inf.total} in frame` : 'Offline'}
-                  </span>
-                </div>
+/* ── Other Cameras — Live Only (Never Saved to DB) ─────────── */
 
-                <div className="vc-mini-grid">
-                  {VEHICLE_TYPE_META.map(vt => (
-                    <div key={vt.key} className="vc-mini-chip" title={`In view: ${inf[vt.key] || 0} | Live session tracked: ${sess[vt.key] || 0}`}>
-                      <span>{vt.icon} {vt.label}</span>
-                      <b>{inf[vt.key] || 0}</b>
-                      <span style={{ fontSize: 8, color: '#94a3b8', marginTop: 1 }}>sess: {sess[vt.key] || 0}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            );
-          })}
-          {remaining.length === 0 && (
-            <div className="empty" style={{ padding: 12 }}>
-              All registered Entry &amp; Exit cameras are saving directly to Gate History.
-            </div>
-          )}
+function OtherCamerasLiveCard({ remaining = [] }) {
+  return (
+    <div className="card">
+      <div className="head" style={{ flexWrap: 'wrap', gap: 8 }}>
+        <div>
+          <h3>📡 Other Cameras (Live Only)</h3>
+          <small>Checkpoint &amp; internal live detections (in memory only)</small>
         </div>
       </div>
-    </>
+      <div className="body" style={{ padding: '12px 16px' }}>
+        {remaining.length > 0 ? (
+          <div className="vc-live-grid">
+            {remaining.map(cam => {
+              const inf = cam.in_frame || { car: 0, bike: 0, auto: 0, ambulance: 0, total: 0 };
+              const sess = cam.session || { car: 0, bike: 0, auto: 0, ambulance: 0, total: 0 };
+              return (
+                <div key={cam.stream} className="vc-live-row">
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+                      <span
+                        style={{
+                          width: 8, height: 8, borderRadius: '50%', flex: 'none',
+                          background: cam.online ? '#10b981' : '#94a3b8',
+                          boxShadow: cam.online ? '0 0 0 3px rgba(16,185,129,0.2)' : 'none'
+                        }}
+                      />
+                      <b style={{ fontSize: 12, color: '#1e293b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={cam.name}>
+                        {cam.name}
+                      </b>
+                      <span className={`badge ${cam.role}`} style={{ fontSize: 8 }}>{cam.role}</span>
+                      {(cam.role === 'entry' || cam.role === 'exit') && cam.count_enabled === false && (
+                        <span className="badge" style={{ background: '#fef3c7', color: '#92400e', fontSize: 8 }}>DB Off</span>
+                      )}
+                    </div>
+                    <span style={{ fontSize: 10, fontWeight: 700, color: cam.online ? '#059669' : '#94a3b8', flex: 'none' }}>
+                      {cam.online ? `${inf.total} in frame` : 'Offline'}
+                    </span>
+                  </div>
+
+                  <div className="vc-mini-grid">
+                    {VEHICLE_TYPE_META.map(vt => (
+                      <div key={vt.key} className="vc-mini-chip" title={`In view: ${inf[vt.key] || 0} | Live session tracked: ${sess[vt.key] || 0}`}>
+                        <span>{vt.icon} {vt.label}</span>
+                        <b>{inf[vt.key] || 0}</b>
+                        <span style={{ fontSize: 8, color: '#94a3b8', marginTop: 1 }}>sess: {sess[vt.key] || 0}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="empty" style={{ padding: 12 }}>
+            All registered Entry &amp; Exit cameras are saving directly to Gate History.
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -2358,8 +2372,8 @@ function App() {
 
       {/* ── Main Content Grid ── */}
       <div className="grid">
-        {/* Left: Journeys (with pagination & smart filtering) + Sightings */}
-        <div className="span8" style={{ display: 'grid', gap: 16 }}>
+        {/* Left: Journeys (with pagination & smart filtering) + Gate Analytics + Remaining Live Cameras */}
+        <div className="span8" style={{ display: 'grid', gap: 16, alignContent: 'start' }}>
           {/* Journey Table Card */}
           <div className="card">
             {/* Header: Title & Download Filtered List Button */}
@@ -2656,6 +2670,9 @@ function App() {
             timeFilter={timeFilter}
             setTimeFilter={setTimeFilter}
           />
+
+          {/* ── Remaining Cameras — Live Only (Never Saved to DB) ── */}
+          <OtherCamerasLiveCard remaining={vehicleCounts?.remaining_cameras_live} />
         </div>
 
         {/* Right: Engine Status + Rules + Registered Cameras */}
