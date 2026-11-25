@@ -38,7 +38,9 @@ class LPD_YuNet:
         self.model.setPreferableTarget(self.target_id)
 
     def setInputSize(self, inputSize):
-        self.input_size = inputSize
+        if tuple(self.input_size) == tuple(inputSize):
+            return
+        self.input_size = np.array(inputSize)
         # re-generate anchors/priorboxes
         self._priorGen()
 
@@ -65,15 +67,24 @@ class LPD_YuNet:
         # Decode
         dets = self._decode(blob)
 
+        # Convert 4-corner polygon coordinates to [x_min, y_min, w, h] for NMSBoxes
+        pts = dets[:, :8].reshape(-1, 4, 2)
+        x_min = pts[:, :, 0].min(axis=1)
+        y_min = pts[:, :, 1].min(axis=1)
+        bw = pts[:, :, 0].max(axis=1) - x_min
+        bh = pts[:, :, 1].max(axis=1) - y_min
+        bboxes = np.stack([x_min, y_min, bw, bh], axis=1).tolist()
+
         # NMS
         keepIdx = cv.dnn.NMSBoxes(
-            bboxes=dets[:, 0:4].tolist(),
+            bboxes=bboxes,
             scores=dets[:, -1].tolist(),
             score_threshold=self.confidence_threshold,
             nms_threshold=self.nms_threshold,
             top_k=self.top_k
-        ) # box_num x class_num
+        )
         if len(keepIdx) > 0:
+            keepIdx = np.array(keepIdx).reshape(-1)
             dets = dets[keepIdx]
             return dets[:self.keep_top_k]
         else:

@@ -36,6 +36,37 @@ try:
     from lpd_yunet import LPD_YuNet
 except Exception:
     LPD_YuNet = None
+
+if LPD_YuNet is not None:
+    class MultiPlateYuNet(LPD_YuNet):
+        """YuNet subclass ensuring axis-aligned NMS boxes and cached prior generation."""
+        def setInputSize(self, inputSize):
+            if tuple(self.input_size) == tuple(inputSize):
+                return
+            self.input_size = np.array(inputSize)
+            self._priorGen()
+
+        def _postprocess(self, blob):
+            dets = self._decode(blob)
+            pts = dets[:, :8].reshape(-1, 4, 2)
+            x_min = pts[:, :, 0].min(axis=1)
+            y_min = pts[:, :, 1].min(axis=1)
+            bw = pts[:, :, 0].max(axis=1) - x_min
+            bh = pts[:, :, 1].max(axis=1) - y_min
+            bboxes = np.stack([x_min, y_min, bw, bh], axis=1).tolist()
+            keepIdx = cv2.dnn.NMSBoxes(
+                bboxes=bboxes,
+                scores=dets[:, -1].tolist(),
+                score_threshold=self.confidence_threshold,
+                nms_threshold=self.nms_threshold,
+                top_k=self.top_k
+            )
+            if len(keepIdx) > 0:
+                keepIdx = np.array(keepIdx).reshape(-1)
+                return dets[keepIdx][:self.keep_top_k]
+            return np.empty(shape=(0, 9))
+else:
+    MultiPlateYuNet = None
 LIVE_DB_PATH = os.environ.get('TRACKER_DB', str(ROOT / 'vehicle_tracker.db') if (os.name == 'nt' or not os.path.exists('/data')) else '/data/vehicle_tracker.db')
 DEMO_DB_PATH = '/data/vehicle_tracker_demo.db' if os.path.exists('/data') else str(ROOT / 'vehicle_tracker_demo.db')
 RECORDINGS_DIR = pathlib.Path('/data/recordings') if os.path.exists('/data/recordings') else (ROOT / 'recordings' if (ROOT / 'recordings').exists() else pathlib.Path(r"d:\Python Projects\recordings"))
@@ -148,17 +179,17 @@ def is_garbage_text(raw):
     t = raw.lower()
     return any(bad in t for bad in GARBAGE_WORDS)
 def is_watermark_zone(cx, cy, w, h):
-    # Top 11% (timestamp: e.g. "11-12-2026 Thu 15:23:44")
-    if cy < int(h * 0.11):
+    # Top 8% (timestamp bar: e.g. "11-12-2026 Thu 15:23:44")
+    if cy < int(h * 0.08):
         return True
-    # Bottom 9% across entire frame
-    if cy > int(h * 0.91):
+    # Very bottom edge strip (5%)
+    if cy > int(h * 0.95):
         return True
-    # Bottom-right corner (where "Exit gate", "Main Gate Outside" is stamped)
-    if cx > int(w * 0.45) and cy > int(h * 0.78):
+    # Bottom-right corner label (where "Exit gate", "Main Gate Outside" is stamped)
+    if cx > int(w * 0.75) and cy > int(h * 0.88):
         return True
-    # Bottom-left corner
-    if cx < int(w * 0.25) and cy > int(h * 0.85):
+    # Bottom-left corner label
+    if cx < int(w * 0.22) and cy > int(h * 0.90):
         return True
     return False
 def clean_indian_text(raw):
@@ -173,6 +204,11 @@ def clean_indian_text(raw):
         if t.startswith(pfx):
             t = fixed + t[len(pfx):]
             break
+    # Strip single leading edge/IND-hologram noise character (e.g. 'EHR55BF1916' -> 'HR55BF1916')
+    if len(t) >= 9 and t[:2] not in INDIAN_STATES and t[1:3] in INDIAN_STATES:
+        tail = t[-4:]
+        if sum(ch.isdigit() or ch in TO_DIGIT for ch in tail) == 4:
+            t = t[1:]
     return t
 def fix_plate(raw_text):
     if is_garbage_text(raw_text):
@@ -230,6 +266,68 @@ def fix_plate(raw_text):
         return candidate
     return None
 cv2.setNumThreads(4)
+VEHICLE_TYPES = ('car', 'bike', 'auto', 'ambulance')
+_VC_CONFUSABLE = str.maketrans({'O': '0', 'Q': '0', 'I': '1', 'L': '1', 'Z': '2', 'S': '5', 'G': '6', 'B': '8'})
+
+def normalize_vehicle_type(name):
+    """Map model/legacy vehicle class names onto the 4 tracked security categories."""
+    t = str(name or 'car').strip().lower()
+    if t == 'ambulance':
+        return 'ambulance'
+    if t in ('auto', 'rickshaw', 'autorickshaw', 'three_wheeler'):
+        return 'auto'
+    if t in ('bike', 'motorcycle', 'motorbike', 'scooter', 'two_wheeler'):
+        return 'bike'
+    return 'car'
+
+def normalize_gate_group(group, display=False):
+    """Normalize optional gate/location group name so cameras monitoring one physical gate dedup cleanly."""
+    clean = re.sub(r'\s+', ' ', str(group or '').strip())[:60]
+    return clean if display else clean.lower()
+
+def are_plates_similar_vc(p1, p2, allow_single_edit=False):
+    """Compare plates tolerating OCR confusables and optional 1-char edit distance at the same gate."""
+    if not p1 or not p2:
+        return False
+    a = re.sub(r'[^A-Z0-9]', '', str(p1).upper())
+    b = re.sub(r'[^A-Z0-9]', '', str(p2).upper())
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    na, nb = a.translate(_VC_CONFUSABLE), b.translate(_VC_CONFUSABLE)
+    if na == nb:
+        return True
+    if not allow_single_edit or len(a) < 6 or len(b) < 6 or na[:2] != nb[:2]:
+        return False
+    if len(na) == len(nb):
+        return sum(1 for x, y in zip(na, nb) if x != y) <= 1
+    if abs(len(na) - len(nb)) == 1 and na[-3:] == nb[-3:]:
+        shorter, longer = (na, nb) if len(na) < len(nb) else (nb, na)
+        i = j = skips = 0
+        while i < len(shorter) and j < len(longer):
+            if shorter[i] == longer[j]:
+                i += 1
+                j += 1
+            else:
+                skips += 1
+                if skips > 1:
+                    return False
+                j += 1
+        return i == len(shorter)
+    return False
+
+def _merge_stream_csv(raw_csv, *extra_streams):
+    """Build an ordered unique comma-separated camera stream list."""
+    ordered = []
+    seen = set()
+    for token in str(raw_csv or '').split(',') + list(extra_streams):
+        s = str(token or '').strip()
+        if s and s not in seen:
+            seen.add(s)
+            ordered.append(s)
+    return ','.join(ordered)
+
 class VehicleDetector:
     """YOLO vehicle & license plate detector with dual-engine (ONNXRuntime / OpenCV-DNN)
     and automatic custom model detection (vehicle.onnx vs yolov8n.onnx)."""
@@ -309,26 +407,43 @@ class VehicleDetector:
             self.cls_names = {2: 'car', 3: 'motorcycle', 5: 'bus', 7: 'truck'}
 
         max_scores = np.max(scores[:, v_cls], axis=1)
-        cls_idx = np.argmax(scores[:, v_cls], axis=1)
         mask = max_scores >= conf_thresh
         if not np.any(mask):
             return []
 
         v_boxes = boxes[mask]
-        v_scores = max_scores[mask]
-        v_cls_chosen = [v_cls[i] for i in cls_idx[mask]]
+        filtered_scores = scores[mask]
         scale_x, scale_y = w / 640.0, h / 640.0
 
         candidate_boxes = []
         scores_list = []
-        for b, s, c in zip(v_boxes, v_scores, v_cls_chosen):
+        v_cls_chosen = []
+        check_special = (scores.shape[1] == 5)
+        for b, s_row in zip(v_boxes, filtered_scores):
+            sub_idx = int(np.argmax(s_row[v_cls]))
+            chosen_cid = v_cls[sub_idx]
+            chosen_score = float(s_row[chosen_cid])
+            # Prioritize specialized vehicle classes over generic 'car' when strong
+            if check_special and chosen_cid != 1:
+                car_s = float(s_row[0])
+                amb_s = float(s_row[4])
+                auto_s = float(s_row[2])
+                bike_s = float(s_row[3])
+                if amb_s >= 0.22 and amb_s >= car_s * 0.70:
+                    chosen_cid, chosen_score = 4, amb_s
+                elif auto_s >= 0.22 and auto_s >= car_s * 0.70:
+                    chosen_cid, chosen_score = 2, auto_s
+                elif bike_s >= 0.22 and bike_s >= car_s * 0.70:
+                    chosen_cid, chosen_score = 3, bike_s
+
             cx, cy, bw, bh = b
             x1 = max(0, int((cx - bw / 2) * scale_x))
             y1 = max(0, int((cy - bh / 2) * scale_y))
             x2 = min(w, int((cx + bw / 2) * scale_x))
             y2 = min(h, int((cy + bh / 2) * scale_y))
             candidate_boxes.append([x1, y1, x2 - x1, y2 - y1])
-            scores_list.append(float(s))
+            scores_list.append(chosen_score)
+            v_cls_chosen.append(chosen_cid)
 
         indices = cv2.dnn.NMSBoxes(candidate_boxes, scores_list, conf_thresh, 0.45)
         results = []
@@ -343,15 +458,26 @@ class VehicleDetector:
                 "name": self.cls_names.get(cid, 'vehicle')
             })
         return results
+def _order_quad(pts):
+    """Order any 4 polygon corners clockwise as [top-left, top-right, bottom-right, bottom-left]."""
+    pts = np.asarray(pts, dtype=np.float32).reshape(4, 2)
+    idx_y = np.argsort(pts[:, 1], kind='mergesort')
+    top = pts[idx_y[:2]]
+    bot = pts[idx_y[2:]]
+    top = top[np.argsort(top[:, 0], kind='mergesort')]
+    bot = bot[np.argsort(bot[:, 0], kind='mergesort')]
+    return np.array([top[0], top[1], bot[1], bot[0]], dtype=np.float32)
+
 class Detector:
     """Multi-stage Hybrid ANPR Pipeline:
-       Stage 1: YOLOv8 confirms vehicle presence.
-       Stage 2A: Direct plates from custom YOLO vehicle model (class 'no_plate').
-       Stage 2B: Dedicated YuNet License Plate Detector (LPD) with 4-corner perspective unwarping.
-       Stage 2C: DBNet text region fallback if YuNet has low confidence.
-       Stage 3: High-resolution PP-OCRv4 recognition with 2-line stacked plate support & character normalization."""
+       Stage 1: YOLOv8 detects vehicles and direct plates across the full frame.
+       Stage 1B: Direct plates from custom YOLO vehicle model (class 'no_plate').
+       Stage 2A: Dedicated YuNet License Plate Detector (LPD) across all unmatched vehicles.
+       Stage 2B: DBNet text region fallback on foreground vehicles if YuNet misses.
+       Stage 3: High-resolution PP-OCRv4 recognition with corner ordering & 2-line support."""
     def __init__(self):
         self.vehicle_detector = VehicleDetector()
+        self.db_input_size = 480
 
         # 1. DBNet text detector (fallback)
         self.detector = cv2.dnn_TextDetectionModel_DB(cv2.dnn.readNet(str(MODELS / 'text_detection_en_ppocrv3_2023may.onnx')))
@@ -359,16 +485,17 @@ class Detector:
         self.detector.setPolygonThreshold(0.40)
         self.detector.setUnclipRatio(1.8)
         self.detector.setMaxCandidates(200)
-        self.detector.setInputSize((736, 736))
+        self.detector.setInputSize((self.db_input_size, self.db_input_size))
         self.detector.setInputMean((123.675, 116.28, 103.53))
         self.detector.setInputScale(1.0 / 255.0 / np.array([0.229, 0.224, 0.225]))
 
-        # 2. Dedicated YuNet License Plate Detector
+        # 2. Dedicated YuNet License Plate Detector (fixed NMSBoxes + cached priors)
         yunet_path = MODELS / 'license_plate_detection_lpd_yunet_2023mar.onnx'
         self.plate_detector = None
-        if LPD_YuNet is not None and yunet_path.is_file():
+        yunet_cls = MultiPlateYuNet or LPD_YuNet
+        if yunet_cls is not None and yunet_path.is_file():
             try:
-                self.plate_detector = LPD_YuNet(modelPath=str(yunet_path), inputSize=[320, 240], confThreshold=0.22)
+                self.plate_detector = yunet_cls(modelPath=str(yunet_path), inputSize=[320, 240], confThreshold=0.22)
                 print("[Detector] Successfully loaded YuNet License Plate Detector")
             except Exception as e:
                 print(f"[Detector] YuNet init notice: {e}")
@@ -395,7 +522,7 @@ class Detector:
     @staticmethod
     def timestamp_mask(frame):
         mask = np.zeros(frame.shape[:2], dtype=np.uint8) + 255
-        mask[:int(frame.shape[0] * 0.12), :] = 0
+        mask[:int(frame.shape[0] * 0.08), :] = 0
         return mask
 
     def _decode_ppocr(self, out):
@@ -412,45 +539,50 @@ class Detector:
         avg_conf = float(np.mean(confs)) if confs else 0.0
         return ''.join(text).upper().replace(' ', ''), avg_conf
 
-    def ocr(self, image, quad):
-        pts = quad.astype(np.float32).reshape(4, 2)
-        w1 = np.linalg.norm(pts[1] - pts[0])
-        w2 = np.linalg.norm(pts[2] - pts[3])
-        h1 = np.linalg.norm(pts[3] - pts[0])
-        h2 = np.linalg.norm(pts[2] - pts[1])
-        pw = max(int(max(w1, w2)), 20)
-        ph = max(int(max(h1, h2)), 10)
+    def _infer_ppocr_line(self, img):
+        if img is None or img.size == 0:
+            return "", 0.0
+        ih, iw = img.shape[:2]
+        interp = cv2.INTER_CUBIC if (iw < 160 or ih < 32) else cv2.INTER_LINEAR
+        resized = cv2.resize(img, (320, 48), interpolation=interp)
+        blob = cv2.dnn.blobFromImage(resized, 1.0 / 127.5, (320, 48), (127.5, 127.5, 127.5), swapRB=True)
+        self.recognizer_v4.setInput(blob)
+        return self._decode_ppocr(self.recognizer_v4.forward())
+
+    def _ocr_detail(self, image, quad):
+        ordered = _order_quad(quad)
+        w1 = np.linalg.norm(ordered[1] - ordered[0])
+        w2 = np.linalg.norm(ordered[2] - ordered[3])
+        h1 = np.linalg.norm(ordered[3] - ordered[0])
+        h2 = np.linalg.norm(ordered[2] - ordered[1])
+        pw = int(max(w1, w2))
+        ph = int(max(h1, h2))
+        if pw < 12 or ph < 6:
+            return "", 0.0
 
         dst = np.array([[0, 0], [pw - 1, 0], [pw - 1, ph - 1], [0, ph - 1]], dtype=np.float32)
-        matrix = cv2.getPerspectiveTransform(pts, dst)
+        matrix = cv2.getPerspectiveTransform(ordered, dst)
         crop = cv2.warpPerspective(image, matrix, (pw, ph))
         if crop is None or crop.size == 0:
-            return ""
+            return "", 0.0
 
         if self.use_ppocrv4:
             aspect = pw / max(ph, 1)
-            # 2-line plate handling (aspect ratio <= 2.2 and sufficient height)
-            if aspect <= 2.2 and ph >= 26:
+            # 2-line stacked plate handling (auto, bike, or square car plates)
+            if aspect <= 1.75 and ph >= 18:
                 mid_y = int(ph * 0.52)
-                top = crop[:mid_y, :]
-                bot = crop[mid_y:, :]
-
-                top_res = cv2.resize(top, (320, 48))
-                blob_top = cv2.dnn.blobFromImage(top_res, 1.0/127.5, (320, 48), (127.5, 127.5, 127.5), swapRB=True)
-                self.recognizer_v4.setInput(blob_top)
-                txt_top, _ = self._decode_ppocr(self.recognizer_v4.forward())
-
-                bot_res = cv2.resize(bot, (320, 48))
-                blob_bot = cv2.dnn.blobFromImage(bot_res, 1.0/127.5, (320, 48), (127.5, 127.5, 127.5), swapRB=True)
-                self.recognizer_v4.setInput(blob_bot)
-                txt_bot, _ = self._decode_ppocr(self.recognizer_v4.forward())
-                return txt_top + txt_bot
-            else:
-                resized = cv2.resize(crop, (320, 48))
-                blob = cv2.dnn.blobFromImage(resized, 1.0/127.5, (320, 48), (127.5, 127.5, 127.5), swapRB=True)
-                self.recognizer_v4.setInput(blob)
-                text, _ = self._decode_ppocr(self.recognizer_v4.forward())
-                return text
+                t_txt, t_c = self._infer_ppocr_line(crop[:mid_y, :])
+                b_txt, b_c = self._infer_ppocr_line(crop[mid_y:, :])
+                return t_txt + b_txt, float((t_c + b_c) / 2.0) if (t_txt or b_txt) else 0.0
+            text, conf = self._infer_ppocr_line(crop)
+            if aspect <= 2.45 and ph >= 18 and not fix_plate(text):
+                mid_y = int(ph * 0.52)
+                t_txt, t_c = self._infer_ppocr_line(crop[:mid_y, :])
+                b_txt, b_c = self._infer_ppocr_line(crop[mid_y:, :])
+                stacked = t_txt + b_txt
+                if fix_plate(stacked):
+                    return stacked, float((t_c + b_c) / 2.0)
+            return text, conf
         elif self.recognizer_crnn is not None:
             gray = cv2.cvtColor(cv2.resize(crop, (100, 32)), cv2.COLOR_BGR2GRAY)
             self.recognizer_crnn.setInput(cv2.dnn.blobFromImage(gray, size=(100, 32), mean=127.5, scalefactor=1 / 127.5))
@@ -459,13 +591,61 @@ class Detector:
             for index in range(out.shape[0]):
                 best = int(np.argmax(out[index][0]))
                 text += '-' if best == 0 else CHARSET[best - 1]
-            return ''.join(char for i, char in enumerate(text) if char != '-' and (i == 0 or char != text[i - 1]))
-        return ""
+            cleaned = ''.join(char for i, char in enumerate(text) if char != '-' and (i == 0 or char != text[i - 1]))
+            return cleaned, (0.75 if cleaned else 0.0)
+        return "", 0.0
+
+    def ocr(self, image, quad):
+        return self._ocr_detail(image, quad)[0]
+
+    @staticmethod
+    def _match_vehicle(cx, cy, vehicles):
+        """Return (index, vehicle_dict) for the smallest vehicle bbox enclosing (cx, cy)."""
+        best_idx, best_v, best_area = None, None, float('inf')
+        for idx, v in enumerate(vehicles):
+            vx1, vy1, vx2, vy2 = v['bbox']
+            if (vx1 - 25) <= cx <= (vx2 + 25) and (vy1 - 25) <= cy <= (vy2 + 25):
+                area = (vx2 - vx1) * (vy2 - vy1)
+                if area < best_area:
+                    best_idx, best_v, best_area = idx, v, area
+        return best_idx, best_v
+
+    def _try_record_plate(self, frame, quad, det_score, fallback_vehicle, vehicles, seen_quads, detections):
+        h, w = frame.shape[:2]
+        ordered = _order_quad(quad).astype(np.float64)
+        center = ordered.mean(axis=0)
+        cx, cy = int(center[0]), int(center[1])
+        if is_watermark_zone(cx, cy, w, h):
+            return False, None
+        if any(np.hypot(center[0] - sc[0], center[1] - sc[1]) < 25 for sc in seen_quads):
+            return False, None
+
+        raw_text, ocr_conf = self._ocr_detail(frame, ordered)
+        if not raw_text or len(raw_text) < 4 or is_garbage_text(raw_text):
+            return False, None
+        normalized = fix_plate(raw_text)
+        if not normalized:
+            return False, None
+
+        m_idx, matched_v = self._match_vehicle(cx, cy, vehicles)
+        v_used = matched_v or fallback_vehicle
+        x_b, y_b, w_b, h_b = cv2.boundingRect(ordered.astype(np.int32))
+        seen_quads.append(center)
+        detections.append({
+            'plate': normalized.upper(),
+            'quad': ordered,
+            'bbox': [x_b, y_b, w_b, h_b],
+            'score': round(float(det_score), 3),
+            'ocr_conf': round(float(ocr_conf), 3),
+            'vehicle_bbox': v_used['bbox'] if v_used else [x_b, y_b, x_b + w_b, y_b + h_b],
+            'vehicle_name': v_used['name'] if v_used else 'vehicle'
+        })
+        return True, m_idx
 
     def scan(self, frame):
         h, w = frame.shape[:2]
-        # ── STAGE 1: Confirm Vehicle Presence First (CUDA YOLOv8 ~4.5ms) ─
-        raw_detections = self.vehicle_detector.detect(frame, conf_thresh=0.25)
+        # ── STAGE 1: Detect All Vehicles & Direct Plates ───────────────────
+        raw_detections = self.vehicle_detector.detect(frame, conf_thresh=0.18)
         if not raw_detections:
             return [], []
 
@@ -477,53 +657,39 @@ class Detector:
         mask = self.timestamp_mask(frame)
         detections = []
         seen_quads = []
+        matched_v_indices = set()
 
-        # ── STAGE 1B: Direct License Plate Extraction (from custom vehicle.onnx) ──
+        # ── STAGE 1B: Direct License Plate Extraction (from vehicle.onnx) ──
         for p in direct_plates:
             px1, py1, px2, py2 = p['bbox']
-            bw = px2 - px1
-            bh = py2 - py1
-            if bw < 20 or bh < 8 or bw > 600 or bh > 200:
+            bw, bh = px2 - px1, py2 - py1
+            if bw < 18 or bh < 8 or bw > 600 or bh > 200:
                 continue
-            center = (px1 + bw / 2, py1 + bh / 2)
-            cx, cy = int(center[0]), int(center[1])
-            if is_watermark_zone(cx, cy, w, h):
-                continue
-            matching_v = None
-            for v in vehicles:
-                vx1, vy1, vx2, vy2 = v['bbox']
-                if (vx1 - 25) <= cx <= (vx2 + 25) and (vy1 - 25) <= cy <= (vy2 + 25):
-                    matching_v = v
-                    break
             quad = np.array([[px1, py1], [px2, py1], [px2, py2], [px1, py2]], dtype=np.float64)
-            raw_text = self.ocr(frame, quad)
-            if not raw_text or len(raw_text) < 4 or is_garbage_text(raw_text):
-                continue
-            normalized = fix_plate(raw_text)
-            if not normalized:
-                continue
-            seen_quads.append(center)
-            detections.append({
-                'plate': normalized.upper(),
-                'quad': quad,
-                'bbox': [px1, py1, bw, bh],
-                'score': round(float(p['score']), 3),
-                'vehicle_bbox': matching_v['bbox'] if matching_v else p['bbox'],
-                'vehicle_name': matching_v['name'] if matching_v else 'vehicle'
-            })
+            ok_rec, m_idx = self._try_record_plate(frame, quad, p['score'], None, vehicles, seen_quads, detections)
+            if not ok_rec:
+                # Tight YOLO box fallback retry with slight padding for outer characters
+                qx1, qy1 = max(0, px1 - 3), max(0, py1 - 2)
+                qx2, qy2 = min(w, px2 + 3), min(h, py2 + 2)
+                quad_pad = np.array([[qx1, qy1], [qx2, qy1], [qx2, qy2], [qx1, qy2]], dtype=np.float64)
+                ok_rec, m_idx = self._try_record_plate(frame, quad_pad, p['score'], None, vehicles, seen_quads, detections)
+            if ok_rec and m_idx is not None:
+                matched_v_indices.add(m_idx)
 
-        # ── STAGE 2: Targeted Vehicle Crop ANPR (YuNet LPD + DBNet Fallback) ──
-        def vehicle_area(v):
+        # ── STAGE 2: Multi-Vehicle Crop ANPR (YuNet LPD + DBNet Fallback) ──
+        def vehicle_area(item):
+            _, v = item
             vx1, vy1, vx2, vy2 = v['bbox']
             return (vx2 - vx1) * (vy2 - vy1)
 
-        sorted_vehicles = sorted(vehicles, key=vehicle_area, reverse=True)[:2]
+        unmatched = [(i, v) for i, v in enumerate(vehicles) if i not in matched_v_indices]
+        sorted_vehicles = sorted(unmatched, key=vehicle_area, reverse=True)[:8]
+        dbnet_runs = 0
 
-        for v in sorted_vehicles:
+        for v_idx, v in sorted_vehicles:
             vx1, vy1, vx2, vy2 = v['bbox']
-            vw = vx2 - vx1
-            vh = vy2 - vy1
-            if vw < 50 or vh < 50:
+            vw, vh = vx2 - vx1, vy2 - vy1
+            if vw < 45 or vh < 40:
                 continue
 
             pad_x = int(vw * 0.10)
@@ -544,86 +710,51 @@ class Detector:
 
             vehicle_plate_found = False
 
-            # Step 2A: Dedicated YuNet License Plate Detector
+            # Step 2A: Dedicated YuNet License Plate Detector (fixed NMS + ordered corners)
             if self.plate_detector is not None:
                 try:
                     self.plate_detector.setInputSize([320, 240])
                     res_yunet = self.plate_detector.infer(cv2.resize(tile, (320, 240)))
                     for yr in res_yunet:
-                        pts_320 = yr[:8].reshape(4, 2)
-                        yscore = float(yr[8])
-                        pts_tile = pts_320.copy()
+                        pts_tile = yr[:8].reshape(4, 2).copy()
                         pts_tile[:, 0] = pts_tile[:, 0] * (crop_w / 320.0) + x0
                         pts_tile[:, 1] = pts_tile[:, 1] * (crop_h / 240.0) + y0
-
-                        center = pts_tile.mean(axis=0)
-                        cx, cy = int(center[0]), int(center[1])
-                        if is_watermark_zone(cx, cy, w, h):
-                            continue
-                        if any(np.hypot(center[0] - sc[0], center[1] - sc[1]) < 25 for sc in seen_quads):
-                            continue
-
-                        raw_text = self.ocr(frame, pts_tile)
-                        normalized = fix_plate(raw_text)
-                        if normalized:
-                            seen_quads.append(center)
-                            x_b, y_b, w_b, h_b = cv2.boundingRect(pts_tile.astype(np.int32))
-                            detections.append({
-                                'plate': normalized.upper(),
-                                'quad': pts_tile,
-                                'bbox': [x_b, y_b, w_b, h_b],
-                                'score': round(yscore, 3),
-                                'vehicle_bbox': v['bbox'],
-                                'vehicle_name': v['name']
-                            })
-                            vehicle_plate_found = True
+                        ok_rec, m_idx = self._try_record_plate(frame, pts_tile, float(yr[8]), v, vehicles, seen_quads, detections)
+                        if ok_rec:
+                            if m_idx is None or m_idx == v_idx:
+                                vehicle_plate_found = True
+                            if m_idx is not None:
+                                matched_v_indices.add(m_idx)
                 except Exception:
                     pass
 
-            # Step 2B: Fallback to DBNet if YuNet didn't find plate
-            if not vehicle_plate_found:
+            # Step 2B: Fallback to DBNet only if YuNet didn't read this vehicle's plate
+            if not vehicle_plate_found and dbnet_runs < 3 and vw >= 90 and vh >= 70:
+                dbnet_runs += 1
                 try:
-                    boxes, scores = self.detector.detect(cv2.resize(tile, (736, 736)))
+                    boxes, scores = self.detector.detect(cv2.resize(tile, (self.db_input_size, self.db_input_size)))
                 except Exception:
                     continue
                 if boxes is None:
                     continue
 
-                sx, sy = crop_w / 736.0, crop_h / 736.0
+                sx = crop_w / float(self.db_input_size)
+                sy = crop_h / float(self.db_input_size)
                 for box, score in zip(boxes, scores):
                     quad = np.array(box, dtype=np.float64).reshape(-1, 2)
                     quad[:, 0] = quad[:, 0] * sx + x0
                     quad[:, 1] = quad[:, 1] * sy + y0
                     x, y, bw, bh = cv2.boundingRect(quad.astype(np.int32))
-                    if bw < 25 or bh < 8 or bw > 600 or bh > 180 or bw / max(bh, 1) < 1.3 or bw / max(bh, 1) > 9:
+                    if bw < 22 or bh < 8 or bw > 600 or bh > 180 or bw / max(bh, 1) < 1.2 or bw / max(bh, 1) > 9:
                         continue
-                    center = (x + bw / 2, y + bh / 2)
-                    cx, cy = int(center[0]), int(center[1])
-                    if is_watermark_zone(cx, cy, w, h):
-                        continue
+                    cx, cy = int(x + bw / 2), int(y + bh / 2)
                     pad_w_chk = vw * 0.15
                     pad_h_chk = vh * 0.15
                     if not ((vx1 - pad_w_chk) <= cx <= (vx2 + pad_w_chk) and (vy1 - pad_h_chk) <= cy <= (vy2 + pad_h_chk)):
                         continue
-                    if any(np.hypot(center[0] - sc[0], center[1] - sc[1]) < 25 for sc in seen_quads):
-                        continue
                     if cy < mask.shape[0] and cx < mask.shape[1] and mask[cy, cx] == 0:
                         continue
-                    raw_text = self.ocr(frame, quad)
-                    if not raw_text or len(raw_text) < 4 or is_garbage_text(raw_text):
-                        continue
-                    normalized = fix_plate(raw_text)
-                    if not normalized:
-                        continue
-                    seen_quads.append(center)
-                    detections.append({
-                        'plate': normalized.upper(),
-                        'quad': quad,
-                        'bbox': [x, y, bw, bh],
-                        'score': round(float(score), 3),
-                        'vehicle_bbox': v['bbox'],
-                        'vehicle_name': v['name']
-                    })
+                    self._try_record_plate(frame, quad, float(score), v, vehicles, seen_quads, detections)
         return detections, vehicles
 class Store:
     def __init__(self, path):
@@ -633,19 +764,36 @@ class Store:
         self.lock = threading.RLock()
         with self.lock:
             self.db.executescript('''
-                CREATE TABLE IF NOT EXISTS devices(stream TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, anpr INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, url TEXT DEFAULT '', masks TEXT DEFAULT '[]', enabled INTEGER NOT NULL DEFAULT 1);
+                CREATE TABLE IF NOT EXISTS devices(stream TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, anpr INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, url TEXT DEFAULT '', masks TEXT DEFAULT '[]', enabled INTEGER NOT NULL DEFAULT 1, gate_group TEXT DEFAULT '', count_enabled INTEGER NOT NULL DEFAULT 1);
                 CREATE TABLE IF NOT EXISTS sightings(id TEXT PRIMARY KEY, stream TEXT NOT NULL, plate TEXT NOT NULL, confidence REAL, ts INTEGER NOT NULL, photo BLOB, plate_photo BLOB);
                 CREATE INDEX IF NOT EXISTS sight_plate ON sightings(plate, ts);
                 CREATE INDEX IF NOT EXISTS sight_ts ON sightings(ts);
                 CREATE TABLE IF NOT EXISTS passages(id INTEGER PRIMARY KEY AUTOINCREMENT, stream TEXT NOT NULL, count INTEGER, ts INTEGER NOT NULL);
                 CREATE INDEX IF NOT EXISTS passage_ts ON passages(ts);
+                CREATE TABLE IF NOT EXISTS vehicle_counts(id TEXT PRIMARY KEY, stream TEXT NOT NULL, direction TEXT NOT NULL, vehicle_type TEXT NOT NULL, plate TEXT, track_id INTEGER, confidence REAL, ts INTEGER NOT NULL, gate_group TEXT DEFAULT '', merged_streams TEXT DEFAULT '');
+                CREATE INDEX IF NOT EXISTS vc_dir_ts ON vehicle_counts(direction, ts);
+                CREATE INDEX IF NOT EXISTS vc_stream_ts ON vehicle_counts(stream, ts);
+                CREATE INDEX IF NOT EXISTS vc_plate_dir ON vehicle_counts(plate, direction, ts);
                 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             ''')
-            for col, col_def in [("url", "TEXT DEFAULT ''"), ("masks", "TEXT DEFAULT '[]'"), ("enabled", "INTEGER NOT NULL DEFAULT 1")]:
+            for tbl, col, col_def in [
+                ("devices", "url", "TEXT DEFAULT ''"),
+                ("devices", "masks", "TEXT DEFAULT '[]'"),
+                ("devices", "enabled", "INTEGER NOT NULL DEFAULT 1"),
+                ("devices", "gate_group", "TEXT DEFAULT ''"),
+                ("devices", "count_enabled", "INTEGER NOT NULL DEFAULT 1"),
+                ("sightings", "vehicle_type", "TEXT DEFAULT 'car'"),
+                ("vehicle_counts", "gate_group", "TEXT DEFAULT ''"),
+                ("vehicle_counts", "merged_streams", "TEXT DEFAULT ''"),
+            ]:
                 try:
-                    self.db.execute(f"ALTER TABLE devices ADD COLUMN {col} {col_def}")
+                    self.db.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {col_def}")
                 except Exception:
                     pass
+            try:
+                self.db.execute("CREATE INDEX IF NOT EXISTS vc_dir_grp_ts ON vehicle_counts(direction, gate_group, ts)")
+            except Exception:
+                pass
             self.db.commit()
             try:
                 states_sql = "','".join(s.upper() for s in INDIAN_STATES)
@@ -678,13 +826,15 @@ class Store:
         return {'visit_gap_min': min(1440, max(1, int(rules.get('visit_gap_min', 30)))),
                 'exit_grace_min': min(1440, max(1, int(rules.get('exit_grace_min', 45)))),
                 'correlate_passages': bool(rules.get('correlate_passages', True)),
-                'correlate_window_s': min(3600, max(30, int(rules.get('correlate_window_s', 300))))}
+                'correlate_window_s': min(3600, max(30, int(rules.get('correlate_window_s', 300)))),
+                'gate_dedup_s': min(120, max(0, int(rules.get('gate_dedup_s', 15))))}
     def save_rules(self, body):
         rules = self.rules()
-        for key in ('visit_gap_min', 'exit_grace_min', 'correlate_window_s'):
+        limits = {'visit_gap_min': (1, 1440), 'exit_grace_min': (1, 1440), 'correlate_window_s': (30, 3600), 'gate_dedup_s': (0, 120)}
+        for key, (lo, hi) in limits.items():
             if key in body:
                 value = int(body[key])
-                if not (1 <= value <= (3600 if key == 'correlate_window_s' else 1440)):
+                if not (lo <= value <= hi):
                     raise ValueError(f'{key} out of range')
                 rules[key] = value
         if 'correlate_passages' in body:
@@ -708,9 +858,11 @@ class Store:
                 d['enabled'] = bool(d['enabled'])
             if 'url' not in d:
                 d['url'] = ''
+            d['gate_group'] = normalize_gate_group(d.get('gate_group', ''), display=True)
+            d['count_enabled'] = bool(d.get('count_enabled', 1))
             result.append(d)
         return result
-    def add_device(self, stream, name, role, anpr=True, url='', masks=None, enabled=True):
+    def add_device(self, stream, name, role, anpr=True, url='', masks=None, enabled=True, gate_group='', count_enabled=True):
         url = str(url or '').strip()
         if not stream and url:
             clean = url.split('?')[0].rstrip('/')
@@ -724,6 +876,7 @@ class Store:
             raise ValueError('Role must be entry, exit or checkpoint')
         name = str(name or stream).strip()[:80] or stream
         masks_json = json.dumps(masks or [])
+        clean_group = normalize_gate_group(gate_group, display=True)
         with self.lock:
             cols = [r[1] for r in self.db.execute('PRAGMA table_info(devices)').fetchall()]
             data_map = {
@@ -739,6 +892,10 @@ class Store:
                 data_map['enabled'] = 1 if enabled else 0
             if 'url' in cols:
                 data_map['url'] = url
+            if 'gate_group' in cols:
+                data_map['gate_group'] = clean_group
+            if 'count_enabled' in cols:
+                data_map['count_enabled'] = 1 if count_enabled else 0
             active_cols = [c for c in cols if c in data_map]
             placeholders = ','.join(['?'] * len(active_cols))
             col_names = ','.join(active_cols)
@@ -753,11 +910,12 @@ class Store:
             if not self.db.execute('DELETE FROM devices WHERE stream=?', (stream,)).rowcount:
                 raise ValueError('Unknown device')
             self.db.commit()
-    def save_sighting(self, stream, plate, confidence, ts, photo=None, plate_photo=None):
+    def save_sighting(self, stream, plate, confidence, ts, photo=None, plate_photo=None, vehicle_type='car'):
         sid = uuid.uuid4().hex
+        vtype = normalize_vehicle_type(vehicle_type)
         with self.lock:
             cols = [r[1] for r in self.db.execute('PRAGMA table_info(sightings)').fetchall()]
-            data_map = {'id': sid, 'stream': stream, 'plate': plate, 'confidence': confidence, 'ts': ts, 'photo': photo, 'plate_photo': plate_photo, 'verified': 0}
+            data_map = {'id': sid, 'stream': stream, 'plate': plate, 'confidence': confidence, 'ts': ts, 'photo': photo, 'plate_photo': plate_photo, 'verified': 0, 'vehicle_type': vtype}
             active_cols = [c for c in cols if c in data_map]
             placeholders = ','.join(['?'] * len(active_cols))
             self.db.execute(f"INSERT INTO sightings({','.join(active_cols)}) VALUES({placeholders})", [data_map[c] for c in active_cols])
@@ -765,7 +923,11 @@ class Store:
             self.db.commit()
         return sid
     def sightings(self, since=0, plate=None, limit=500):
-        query = 'SELECT id,stream,plate,confidence,ts,(photo IS NOT NULL),(plate_photo IS NOT NULL) FROM sightings WHERE ts>=?'
+        with self.lock:
+            cols = [r[1] for r in self.db.execute('PRAGMA table_info(sightings)').fetchall()]
+        has_vtype = 'vehicle_type' in cols
+        vtype_sel = ',vehicle_type' if has_vtype else ''
+        query = f'SELECT id,stream,plate,confidence,ts,(photo IS NOT NULL),(plate_photo IS NOT NULL){vtype_sel} FROM sightings WHERE ts>=?'
         params = [since]
         if plate:
             query += ' AND plate=?'
@@ -776,7 +938,8 @@ class Store:
             rows = self.db.execute(query, params).fetchall()
         return [{'id': r[0], 'stream': r[1], 'plate': r[2], 'confidence': r[3], 'ts': r[4],
                  'photo_url': f'/sightings/{r[0]}/photo' if r[5] else None,
-                 'plate_url': f'/sightings/{r[0]}/plate' if r[6] else None} for r in rows]
+                 'plate_url': f'/sightings/{r[0]}/plate' if r[6] else None,
+                 'vehicle_type': normalize_vehicle_type(r[7]) if (has_vtype and len(r) > 7 and r[7]) else 'car'} for r in rows]
     def sighting_photo(self, sid, kind='photo'):
         column = 'plate_photo' if kind == 'plate' else 'photo'
         with self.lock:
@@ -790,6 +953,277 @@ class Store:
     def passages(self, since=0):
         with self.lock:
             return [{'stream': r[0], 'count': r[1], 'ts': r[2]} for r in self.db.execute('SELECT stream,count,ts FROM passages WHERE ts>=? ORDER BY ts', (since,)).fetchall()]
+    @staticmethod
+    def _pick_upgraded_type(existing_type, candidate_type):
+        e = normalize_vehicle_type(existing_type)
+        c = normalize_vehicle_type(candidate_type)
+        return c if (e == 'car' and c != 'car') else e
+    @staticmethod
+    def _are_vtypes_compatible(t1, t2):
+        a, b = normalize_vehicle_type(t1), normalize_vehicle_type(t2)
+        return a == b or {a, b} <= {'car', 'ambulance'}
+    def _claim_gate_row(self, row, stream, vtype, clean_plate=None, conf=None):
+        """Merge a synchronized multi-camera observation into an existing vehicle_counts record."""
+        row_id, row_stream, cur_vtype, cur_plate, cur_conf, cur_merged = row
+        merged = _merge_stream_csv(cur_merged or row_stream, row_stream, stream)
+        new_vtype = self._pick_upgraded_type(cur_vtype, vtype)
+        new_plate = cur_plate or clean_plate
+        new_conf = max(float(cur_conf or 0), float(conf or 0))
+        self.db.execute(
+            'UPDATE vehicle_counts SET vehicle_type=?, plate=?, confidence=?, merged_streams=? WHERE id=?',
+            (new_vtype, new_plate, new_conf, merged, row_id)
+        )
+        self.db.commit()
+        return row_id
+    def record_vehicle_count(self, stream, direction, vehicle_type, plate, track_id, confidence, ts, dedup_gap_ms=1800000, gate_group='', gate_dedup_ms=15000):
+        """Persist an incoming or outgoing vehicle event with dynamic 1-to-1 cross-camera gate deduplication."""
+        if direction not in ('incoming', 'outgoing'):
+            return None, False
+        vtype = normalize_vehicle_type(vehicle_type)
+        clean_plate = plate.upper() if plate else None
+        norm_grp = normalize_gate_group(gate_group)
+        ts_val = int(ts)
+        conf_val = float(confidence or 0)
+        gate_dedup_ms = max(0, int(gate_dedup_ms or 0))
+        with self.lock:
+            # Tier 1: Exact or OCR-confusable plate match across the visit gap window
+            if clean_plate:
+                plate_cands = self.db.execute(
+                    'SELECT id, stream, vehicle_type, plate, confidence, merged_streams FROM vehicle_counts '
+                    'WHERE direction=? AND plate IS NOT NULL AND ts>=? AND ts<=? ORDER BY ABS(ts - ?) ASC',
+                    (direction, ts_val - dedup_gap_ms, ts_val + dedup_gap_ms, ts_val)
+                ).fetchall()
+                for row in plate_cands:
+                    if are_plates_similar_vc(row[3], clean_plate, allow_single_edit=False):
+                        return self._claim_gate_row(row, stream, vtype, clean_plate, conf_val), True
+
+            # Tier 2 & 3: Dynamic multi-camera 1-to-1 consumption within gate_dedup_ms for same (direction, gate_group)
+            if gate_dedup_ms > 0:
+                gate_rows = self.db.execute(
+                    "SELECT id, stream, vehicle_type, plate, confidence, merged_streams, ts FROM vehicle_counts "
+                    "WHERE direction=? AND LOWER(TRIM(COALESCE(gate_group,'')))=? AND ts>=? AND ts<=? ORDER BY ABS(ts - ?) ASC",
+                    (direction, norm_grp, ts_val - gate_dedup_ms, ts_val + gate_dedup_ms, ts_val)
+                ).fetchall()
+                unclaimed = []
+                for row in gate_rows:
+                    claimed = set(_merge_stream_csv(row[5] or row[1], row[1]).split(','))
+                    if stream not in claimed:
+                        unclaimed.append(row)
+
+                if clean_plate:
+                    # Tier 2: 1-char OCR variant on a peer camera at the same gate
+                    for row in unclaimed:
+                        if row[3] and are_plates_similar_vc(row[3], clean_plate, allow_single_edit=True):
+                            return self._claim_gate_row(row[:6], stream, vtype, clean_plate, conf_val), True
+                    # Tier 3: Attach late plate onto an unplated peer-camera detection of the same vehicle type
+                    unplated = [r for r in unclaimed if not r[3] and self._are_vtypes_compatible(r[2], vtype)]
+                    unplated.sort(key=lambda r: (0 if normalize_vehicle_type(r[2]) == vtype else 1, abs(int(r[6]) - ts_val)))
+                    if unplated:
+                        return self._claim_gate_row(unplated[0][:6], stream, vtype, clean_plate, conf_val), True
+                else:
+                    # Tier 3b: Unplated detection on a peer camera claims 1 compatible peer row (prefers exact type + unplated first)
+                    compat = [r for r in unclaimed if self._are_vtypes_compatible(r[2], vtype)]
+                    compat.sort(key=lambda r: (0 if normalize_vehicle_type(r[2]) == vtype else 1, 0 if not r[3] else 1, abs(int(r[6]) - ts_val)))
+                    if compat:
+                        return self._claim_gate_row(compat[0][:6], stream, vtype, None, conf_val), True
+
+            eid = uuid.uuid4().hex
+            self.db.execute(
+                'INSERT INTO vehicle_counts(id, stream, direction, vehicle_type, plate, track_id, confidence, ts, gate_group, merged_streams) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                (eid, stream, direction, vtype, clean_plate, track_id, conf_val, ts_val, norm_grp, stream)
+            )
+            self.db.commit()
+        return eid, False
+    def update_vehicle_count(self, row_id, vehicle_type=None, plate=None, dedup_gap_ms=1800000, gate_dedup_ms=15000):
+        """Refine vehicle type or attach late ANPR plate (merging duplicate peer/revisit rows when matched)."""
+        if not row_id:
+            return row_id
+        gate_dedup_ms = max(0, int(gate_dedup_ms or 0))
+        with self.lock:
+            cur_row = self.db.execute(
+                "SELECT stream, direction, COALESCE(gate_group,''), vehicle_type, plate, ts, merged_streams FROM vehicle_counts WHERE id=?",
+                (row_id,)
+            ).fetchone()
+            if not cur_row:
+                return row_id
+            cur_stream, direction, cur_grp, cur_vtype, cur_plate, cur_ts, cur_merged = cur_row
+            norm_grp = normalize_gate_group(cur_grp)
+            cur_streams = [s for s in _merge_stream_csv(cur_merged or cur_stream, cur_stream).split(',') if s]
+            cur_stream_set = set(cur_streams)
+            new_vtype = self._pick_upgraded_type(cur_vtype, vehicle_type) if vehicle_type else cur_vtype
+            clean_plate = plate.upper() if plate else cur_plate
+            if clean_plate and clean_plate != cur_plate:
+                cands = self.db.execute(
+                    "SELECT id, stream, COALESCE(gate_group,''), vehicle_type, plate, ts, merged_streams, confidence FROM vehicle_counts "
+                    "WHERE direction=? AND plate IS NOT NULL AND ts>=? AND ts<=? AND id!=? ORDER BY ABS(ts - ?) ASC",
+                    (direction, int(cur_ts) - dedup_gap_ms, int(cur_ts) + dedup_gap_ms, row_id, int(cur_ts))
+                ).fetchall()
+                other = next((r for r in cands if are_plates_similar_vc(r[4], clean_plate, allow_single_edit=False)), None)
+                if not other and gate_dedup_ms > 0:
+                    for r in cands:
+                        other_set = set(_merge_stream_csv(r[6] or r[1], r[1]).split(','))
+                        if (normalize_gate_group(r[2]) == norm_grp and abs(int(r[5]) - int(cur_ts)) <= gate_dedup_ms
+                                and cur_stream_set.isdisjoint(other_set) and are_plates_similar_vc(r[4], clean_plate, allow_single_edit=True)):
+                            other = r
+                            break
+                if other:
+                    target_type = self._pick_upgraded_type(other[3], new_vtype)
+                    merged_union = _merge_stream_csv(other[6] or other[1], other[1], *cur_streams)
+                    self.db.execute(
+                        'UPDATE vehicle_counts SET vehicle_type=?, merged_streams=? WHERE id=?',
+                        (target_type, merged_union, other[0])
+                    )
+                    self.db.execute('DELETE FROM vehicle_counts WHERE id=?', (row_id,))
+                    self.db.commit()
+                    return other[0]
+            self.db.execute(
+                'UPDATE vehicle_counts SET vehicle_type=?, plate=?, merged_streams=? WHERE id=?',
+                (new_vtype, clean_plate, ','.join(cur_streams), row_id)
+            )
+            self.db.commit()
+        return row_id
+    @staticmethod
+    def _empty_vtype_bucket():
+        return {'car': 0, 'bike': 0, 'auto': 0, 'ambulance': 0, 'total': 0}
+    def vehicle_counts_summary(self, from_ts=0, to_ts=None, granularity='hourly', event_limit=50):
+        """Query persisted historical incoming/outgoing vehicle counts from vehicle_counts table."""
+        end_ts = int(to_ts) if to_ts is not None else int(time.time() * 1000)
+        start_ts = max(0, int(from_ts or 0))
+        devices = {d['stream']: d for d in self.devices()}
+
+        with self.lock:
+            agg_rows = self.db.execute(
+                'SELECT direction, vehicle_type, COUNT(*) FROM vehicle_counts WHERE ts>=? AND ts<=? GROUP BY direction, vehicle_type',
+                (start_ts, end_ts)
+            ).fetchall()
+            cam_rows = self.db.execute(
+                'SELECT stream, direction, vehicle_type, COUNT(*) FROM vehicle_counts WHERE ts>=? AND ts<=? GROUP BY stream, direction, vehicle_type',
+                (start_ts, end_ts)
+            ).fetchall()
+            raw_hist = self.db.execute(
+                'SELECT direction, vehicle_type, ts FROM vehicle_counts WHERE ts>=? AND ts<=? ORDER BY ts',
+                (start_ts, end_ts)
+            ).fetchall()
+            event_rows = self.db.execute(
+                "SELECT id, stream, direction, vehicle_type, plate, confidence, ts, COALESCE(gate_group,''), COALESCE(merged_streams,'') "
+                "FROM vehicle_counts WHERE ts>=? AND ts<=? ORDER BY ts DESC LIMIT ?",
+                (start_ts, end_ts, max(1, int(event_limit)))
+            ).fetchall()
+            all_rows = self.db.execute(
+                'SELECT direction, vehicle_type, COUNT(*) FROM vehicle_counts GROUP BY direction, vehicle_type'
+            ).fetchall()
+            bounds = self.db.execute('SELECT MIN(ts), MAX(ts) FROM vehicle_counts').fetchone()
+
+        incoming = self._empty_vtype_bucket()
+        outgoing = self._empty_vtype_bucket()
+        for direction, vtype, cnt in agg_rows:
+            vt = normalize_vehicle_type(vtype)
+            target = incoming if direction == 'incoming' else outgoing
+            target[vt] += int(cnt)
+            target['total'] += int(cnt)
+
+        all_in = self._empty_vtype_bucket()
+        all_out = self._empty_vtype_bucket()
+        for direction, vtype, cnt in all_rows:
+            vt = normalize_vehicle_type(vtype)
+            target = all_in if direction == 'incoming' else all_out
+            target[vt] += int(cnt)
+            target['total'] += int(cnt)
+
+        cam_map = {}
+        for stream, direction, vtype, cnt in cam_rows:
+            vt = normalize_vehicle_type(vtype)
+            key = (stream, direction)
+            if key not in cam_map:
+                dev = devices.get(stream, {})
+                cam_map[key] = {
+                    'stream': stream,
+                    'name': dev.get('name', stream),
+                    'role': dev.get('role', direction),
+                    'direction': direction,
+                    'gate_group': dev.get('gate_group', ''),
+                    **self._empty_vtype_bucket()
+                }
+            cam_map[key][vt] += int(cnt)
+            cam_map[key]['total'] += int(cnt)
+
+        is_daily = (granularity == 'daily') or (start_ts > 0 and (end_ts - start_ts) > 48 * 3600000) or (start_ts == 0)
+        bucket_ms = 86400000 if is_daily else 3600000
+        hist_buckets = {}
+        for direction, vtype, ts_val in raw_hist:
+            vt = normalize_vehicle_type(vtype)
+            b_ts = (int(ts_val) + IST_OFFSET_MS) // bucket_ms * bucket_ms - IST_OFFSET_MS
+            slot = hist_buckets.setdefault(b_ts, {
+                'bucket': b_ts,
+                'incoming': self._empty_vtype_bucket(),
+                'outgoing': self._empty_vtype_bucket()
+            })
+            side = slot['incoming'] if direction == 'incoming' else slot['outgoing']
+            side[vt] += 1
+            side['total'] += 1
+
+        recent_events = []
+        for r in event_rows:
+            streams_seen = [s for s in _merge_stream_csv(r[8] or r[1], r[1]).split(',') if s]
+            dev_info = devices.get(r[1], {})
+            grp_disp = dev_info.get('gate_group') or r[7] or ''
+            recent_events.append({
+                'id': r[0],
+                'stream': r[1],
+                'camera': dev_info.get('name', r[1]),
+                'direction': r[2],
+                'vehicle_type': normalize_vehicle_type(r[3]),
+                'plate': r[4],
+                'confidence': round(float(r[5]), 2) if r[5] is not None else None,
+                'ts': r[6],
+                'gate_group': grp_disp,
+                'merged_streams': streams_seen,
+                'merged_cameras': [devices.get(s, {}).get('name', s) for s in streams_seen]
+            })
+
+        return {
+            'window': {'from_ts': start_ts, 'to_ts': end_ts, 'granularity': 'daily' if is_daily else 'hourly'},
+            'incoming': incoming,
+            'outgoing': outgoing,
+            'by_camera': sorted(cam_map.values(), key=lambda x: (x['direction'], -x['total'])),
+            'history': [hist_buckets[k] for k in sorted(hist_buckets.keys())],
+            'recent_events': recent_events,
+            'all_time': {
+                'incoming': all_in,
+                'outgoing': all_out,
+                'earliest_ts': bounds[0] if bounds else None,
+                'latest_ts': bounds[1] if bounds else None
+            }
+        }
+    def vehicle_counts_events(self, from_ts=0, to_ts=None, direction=None, vehicle_type=None, limit=5000):
+        end_ts = int(to_ts) if to_ts is not None else int(time.time() * 1000)
+        start_ts = max(0, int(from_ts or 0))
+        devices = {d['stream']: d for d in self.devices()}
+        sql = "SELECT id, stream, direction, vehicle_type, plate, confidence, ts, COALESCE(gate_group,''), COALESCE(merged_streams,'') FROM vehicle_counts WHERE ts>=? AND ts<=?"
+        params = [start_ts, end_ts]
+        if direction in ('incoming', 'outgoing'):
+            sql += ' AND direction=?'
+            params.append(direction)
+        if vehicle_type in VEHICLE_TYPES:
+            sql += ' AND vehicle_type=?'
+            params.append(vehicle_type)
+        sql += ' ORDER BY ts DESC LIMIT ?'
+        params.append(max(1, min(20000, int(limit))))
+        with self.lock:
+            rows = self.db.execute(sql, params).fetchall()
+        out = []
+        for r in rows:
+            streams_seen = [s for s in _merge_stream_csv(r[8] or r[1], r[1]).split(',') if s]
+            dev_info = devices.get(r[1], {})
+            out.append({
+                'id': r[0], 'stream': r[1], 'camera': dev_info.get('name', r[1]),
+                'direction': r[2], 'vehicle_type': normalize_vehicle_type(r[3]),
+                'plate': r[4], 'confidence': round(float(r[5]), 2) if r[5] is not None else None, 'ts': r[6],
+                'gate_group': dev_info.get('gate_group') or r[7] or '',
+                'merged_streams': streams_seen,
+                'merged_cameras': [devices.get(s, {}).get('name', s) for s in streams_seen]
+            })
+        return out
 def journeys(store, since_ms, plate_filter=None):
     """Cluster plate sightings into visits. A new visit starts after visit_gap_min
     of silence for the same plate. Exit is confirmed when the last sighting is on
@@ -833,9 +1267,18 @@ def journeys(store, since_ms, plate_filter=None):
             else:
                 status, exited_at, exit_confirmed = 'on_site', None, False
             end = exited_at or now_ms
-            out.append({'plate': plate, 'status': status, 'exit_confirmed': exit_confirmed,
-                        'entry': {'stream': first['stream'], 'device': devices.get(first['stream'], {}).get('name', first['stream']), 'at': first['ts'], 'photo_url': first['photo_url'], 'plate_url': first['plate_url'], 'confidence': first['confidence']},
-                        'exit': {'stream': last['stream'], 'device': devices.get(last['stream'], {}).get('name', last['stream']), 'at': exited_at, 'photo_url': last['photo_url'], 'confidence': last['confidence']} if exited_at else None,
+            vtype_counts = collections.Counter(normalize_vehicle_type(r.get('vehicle_type')) for r in reads_v)
+            if vtype_counts.get('ambulance', 0) > 0:
+                j_vtype = 'ambulance'
+            elif vtype_counts.get('auto', 0) > 0:
+                j_vtype = 'auto'
+            elif vtype_counts.get('bike', 0) > 0:
+                j_vtype = 'bike'
+            else:
+                j_vtype = 'car'
+            out.append({'plate': plate, 'vehicle_type': j_vtype, 'status': status, 'exit_confirmed': exit_confirmed,
+                        'entry': {'id': first.get('id'), 'stream': first['stream'], 'device': devices.get(first['stream'], {}).get('name', first['stream']), 'at': first['ts'], 'photo_url': first['photo_url'], 'plate_url': first['plate_url'], 'confidence': first['confidence']},
+                        'exit': {'id': last.get('id'), 'stream': last['stream'], 'device': devices.get(last['stream'], {}).get('name', last['stream']), 'at': exited_at, 'photo_url': last['photo_url'], 'confidence': last['confidence']} if exited_at else None,
                         'cameras': cameras, 'camera_count': len(cameras), 'reads': len(reads_v),
                         'first_at': first['ts'], 'last_at': last['ts'], 'dwell_ms': max(0, end - first['ts'])})
     out.sort(key=lambda v: v['first_at'], reverse=True)
@@ -873,6 +1316,12 @@ class Engine:
                     'gen': self.generation,
                     'running': True,
                     'latest': None, 'jpeg': None, 'sequence': 0, 'seen': {}, 'pending': {}, 'noise': {},
+                    'tracks': {}, 'next_track_id': 1,
+                    'live_counts': {
+                        'in_frame': Store._empty_vtype_bucket(),
+                        'session': Store._empty_vtype_bucket(),
+                        'updated_at': None
+                    },
                     'last_out': 0, 'meta': {'fps': 0, 'scan_ms': 0, 'plates': 0, 'error': None}
                 }
                 threading.Thread(target=self.capture, args=(stream, self.generation), daemon=True).start()
@@ -1016,14 +1465,218 @@ class Engine:
 
             cap.release()
             time.sleep(1.0)
-    def canonical(self, worker, plate, score=0.85):
+    def canonical(self, worker, plate, score=0.85, center=None):
+        """Merge same-vehicle OCR jitter in pending buffer without collapsing distinct vehicles."""
         for other, item in worker['pending'].items():
             if len(other) == len(plate) and sum(a != b for a, b in zip(other, plate)) <= 2:
+                # Never merge plates belonging to spatially separate vehicles in the frame
+                if center is not None and item.get('center') is not None:
+                    if float(np.linalg.norm(center - item['center'])) > 140:
+                        continue
+                elif sum(a != b for a, b in zip(other, plate)) > 1:
+                    continue
                 cands = item.setdefault('candidates', {})
                 cands[plate] = cands.get(plate, 0.0) + score
                 consensus = max(cands.items(), key=lambda x: x[1])[0]
                 return consensus
         return plate
+    @staticmethod
+    def _bbox_iou(a, b):
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        if ix2 <= ix1 or iy2 <= iy1:
+            return 0.0
+        inter = (ix2 - ix1) * (iy2 - iy1)
+        area_a = max(1, (ax2 - ax1) * (ay2 - ay1))
+        area_b = max(1, (bx2 - bx1) * (by2 - by1))
+        return inter / float(area_a + area_b - inter)
+
+    @staticmethod
+    def _resolve_track_type(type_votes):
+        total_votes = sum(type_votes.values())
+        if not total_votes:
+            return 'car'
+        # Prioritize ambulance/auto/bike if supported by repeated votes or majority
+        for specialized in ('ambulance', 'auto', 'bike'):
+            cnt = type_votes.get(specialized, 0)
+            if cnt >= 2 or (cnt >= 1 and total_votes <= 2) or (cnt / float(total_votes) >= 0.35):
+                return specialized
+        return 'car'
+
+    def _update_tracks_and_collect_ops(self, worker, stream, role, count_enabled, vehicles, detections, frame_shape, now_mono, now_ms):
+        """Match detected vehicles to persistent per-camera tracks and emit DB ops for gate-counting cameras."""
+        fh, fw = frame_shape[:2]
+        valid_vehicles = []
+        in_frame = Store._empty_vtype_bucket()
+        for v in vehicles:
+            vx1, vy1, vx2, vy2 = v['bbox']
+            vw, vh = vx2 - vx1, vy2 - vy1
+            if v.get('score', 0) < 0.24 or vw < 48 or vh < 40:
+                continue
+            cx, cy = (vx1 + vx2) / 2.0, (vy1 + vy2) / 2.0
+            if is_watermark_zone(int(cx), int(cy), fw, fh):
+                continue
+            vtype = normalize_vehicle_type(v.get('name'))
+            valid_vehicles.append({
+                'bbox': [vx1, vy1, vx2, vy2],
+                'center': (cx, cy),
+                'score': float(v.get('score', 0)),
+                'vtype': vtype,
+                'diag': float(np.hypot(vw, vh))
+            })
+            in_frame[vtype] += 1
+            in_frame['total'] += 1
+
+        tracks = worker.setdefault('tracks', {})
+        # Retire tracks unseen for > 6.0s (prevents double-counting during brief occlusions)
+        for tid in [k for k, tr in tracks.items() if now_mono - tr['last_mono'] > 6.0]:
+            tracks.pop(tid, None)
+
+        # Greedy 1-to-1 matching by IoU / normalized center proximity
+        pairs = []
+        for tid, tr in tracks.items():
+            tcx, tcy = tr['center']
+            tx1, ty1, tx2, ty2 = tr['bbox']
+            tdiag = float(np.hypot(tx2 - tx1, ty2 - ty1))
+            for di, dv in enumerate(valid_vehicles):
+                iou = self._bbox_iou(tr['bbox'], dv['bbox'])
+                dist = float(np.hypot(tcx - dv['center'][0], tcy - dv['center'][1]))
+                max_diag = max(tdiag, dv['diag'], 1.0)
+                if iou >= 0.22 or dist <= 0.45 * max_diag:
+                    score = iou + max(0.0, 1.0 - dist / max_diag) * 0.4
+                    pairs.append((score, tid, di))
+        pairs.sort(reverse=True)
+
+        matched_tids, matched_didx = set(), set()
+        for _, tid, di in pairs:
+            if tid in matched_tids or di in matched_didx:
+                continue
+            matched_tids.add(tid)
+            matched_didx.add(di)
+            tr = tracks[tid]
+            dv = valid_vehicles[di]
+            tr['bbox'] = dv['bbox']
+            tr['center'] = dv['center']
+            tr['last_mono'] = now_mono
+            tr['hits'] += 1
+            tr['misses'] = 0
+            tr['best_score'] = max(tr['best_score'], dv['score'])
+            tr['types'][dv['vtype']] += 1
+
+        for tid, tr in tracks.items():
+            if tid not in matched_tids:
+                tr['misses'] += 1
+
+        for di, dv in enumerate(valid_vehicles):
+            if di in matched_didx:
+                continue
+            tid = worker.get('next_track_id', 1)
+            worker['next_track_id'] = tid + 1
+            tracks[tid] = {
+                'id': tid,
+                'bbox': dv['bbox'],
+                'center': dv['center'],
+                'first_ts': now_ms,
+                'last_mono': now_mono,
+                'hits': 1,
+                'misses': 0,
+                'best_score': dv['score'],
+                'types': collections.Counter({dv['vtype']: 1}),
+                'plate': None,
+                'counted': False,
+                'db_id': None,
+                'saved_type': None,
+                'saved_plate': None
+            }
+
+        # Attach ANPR plate readings to matching tracked vehicles
+        for det in detections:
+            dc = det['quad'].mean(axis=0)
+            best_tid, best_score_m = None, 0.0
+            for tid, tr in tracks.items():
+                tx1, ty1, tx2, ty2 = tr['bbox']
+                iou = self._bbox_iou(tr['bbox'], det.get('vehicle_bbox', tr['bbox']))
+                inside = (tx1 - 25) <= dc[0] <= (tx2 + 25) and (ty1 - 25) <= dc[1] <= (ty2 + 25)
+                m_val = iou + (0.5 if inside else 0.0)
+                if m_val > best_score_m:
+                    best_score_m, best_tid = m_val, tid
+            if best_tid is not None and best_score_m > 0.1:
+                tracks[best_tid]['plate'] = det['plate']
+
+        direction = 'incoming' if (count_enabled and role == 'entry') else ('outgoing' if (count_enabled and role == 'exit') else None)
+        db_ops = []
+
+        if direction in ('incoming', 'outgoing'):
+            for tid, tr in tracks.items():
+                if tr['hits'] < 2 and not tr['plate']:
+                    continue
+                v_type = self._resolve_track_type(tr['types'])
+                if not tr['counted']:
+                    tr['counted'] = True
+                    tr['saved_type'] = v_type
+                    tr['saved_plate'] = tr['plate']
+                    db_ops.append(('insert', tid, direction, v_type, tr['plate'], tr['best_score'], tr['first_ts']))
+                elif tr['db_id'] and (v_type != tr['saved_type'] or (tr['plate'] and tr['plate'] != tr['saved_plate'])):
+                    tr['saved_type'] = v_type
+                    if tr['plate']:
+                        tr['saved_plate'] = tr['plate']
+                    db_ops.append(('update', tid, tr['db_id'], v_type, tr['plate']))
+        else:
+            # Remaining cameras (or gate cameras with count_enabled=False): update live-only session & in-frame counts without DB writes
+            live = worker.setdefault('live_counts', {
+                'in_frame': Store._empty_vtype_bucket(),
+                'session': Store._empty_vtype_bucket(),
+                'updated_at': None
+            })
+            sess = live['session']
+            for tid, tr in tracks.items():
+                if tr['hits'] < 2:
+                    continue
+                v_type = self._resolve_track_type(tr['types'])
+                if not tr['counted']:
+                    tr['counted'] = True
+                    tr['saved_type'] = v_type
+                    sess[v_type] += 1
+                    sess['total'] += 1
+                elif v_type != tr['saved_type'] and tr['saved_type'] == 'car' and v_type != 'car':
+                    if sess['car'] > 0:
+                        sess['car'] -= 1
+                    sess[v_type] += 1
+                    tr['saved_type'] = v_type
+            live['in_frame'] = in_frame
+            live['updated_at'] = now_ms
+
+        return db_ops
+
+    def remaining_cameras_live(self):
+        """Return live in-memory vehicle counts for non-gate cameras or gate cameras with counting disabled (not saved to DB)."""
+        devices = [d for d in self.store.devices() if d.get('role') not in ('entry', 'exit') or not d.get('count_enabled', True)]
+        out = []
+        with self.lock:
+            for d in devices:
+                s = d['stream']
+                w = self.workers.get(s)
+                live = (w or {}).get('live_counts') or {}
+                meta = (w or {}).get('meta') or {}
+                in_frame = dict(live.get('in_frame') or Store._empty_vtype_bucket())
+                session = dict(live.get('session') or Store._empty_vtype_bucket())
+                online = bool(w and w.get('jpeg') is not None and not meta.get('error'))
+                out.append({
+                    'stream': s,
+                    'name': d.get('name', s),
+                    'role': d.get('role', 'checkpoint'),
+                    'count_enabled': bool(d.get('count_enabled', True)),
+                    'gate_group': d.get('gate_group', ''),
+                    'online': online,
+                    'error': meta.get('error'),
+                    'updated_at': live.get('updated_at'),
+                    'in_frame': in_frame,
+                    'session': session
+                })
+        return out
+
     def infer_loop(self):
         last_frame = {}
         last_infer_time = {}
@@ -1031,12 +1684,17 @@ class Engine:
             now = time.monotonic()
             with self.lock:
                 items = [(stream, w['latest'], w) for stream, w in self.workers.items()]
-            # Temporal Decimation: pace inference to ~5 FPS (200ms interval) per camera
+            # Temporal Decimation: pace inference to ~5 FPS (200ms interval) per camera, oldest-scanned first
             items = [(s, latest, w) for s, latest, w in items
                      if latest and last_frame.get(s) != latest[1] and (now - last_infer_time.get(s, 0)) >= 0.20]
             if not items:
                 time.sleep(0.03)
                 continue
+            items.sort(key=lambda item: last_infer_time.get(item[0], 0))
+            dev_map = {d['stream']: d for d in self.store.devices()}
+            rules_cfg = self.store.rules()
+            dedup_gap_ms = rules_cfg.get('visit_gap_min', 30) * 60000
+            gate_dedup_ms = rules_cfg.get('gate_dedup_s', 15) * 1000
             for stream, (original, captured), worker in items:
                 last_frame[stream] = captured
                 last_infer_time[stream] = time.monotonic()
@@ -1060,43 +1718,85 @@ class Engine:
 
                     now = time.monotonic()
                     now_ms = int(time.time() * 1000)
+                    pending_sightings = []
                     with self.lock:
                         worker['seen'] = {p: ts for p, ts in worker['seen'].items() if now - ts < 45}
                         worker['pending'] = {p: i for p, i in worker['pending'].items() if now - i['last'] < 20}
                         for det in detections:
-                            det['plate'] = self.canonical(worker, det['plate'], det['score'])
+                            center = det['quad'].mean(axis=0)
+                            det['plate'] = self.canonical(worker, det['plate'], det['score'], center=center)
                             x, y, w, h = det['bbox']
                             cv2.polylines(frame, [det['quad'].astype(np.int32)], True, (60, 220, 120), 2)
                             cv2.putText(frame, det['plate'], (x, max(15, y - 7)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (60, 220, 120), 2, cv2.LINE_AA)
                             if det['plate'] in worker['seen']:
                                 continue
-                            center = det['quad'].mean(axis=0)
                             previous = worker['pending'].get(det['plate'])
                             sightings = (previous['count'] if previous else 0) + 1
                             cands = (previous.get('candidates') if previous else {}) or {det['plate']: det['score']}
                             worker['pending'][det['plate']] = {'count': sightings, 'center': center, 'last': now, 'candidates': cands}
-                            if sightings < 2 and det['score'] < 0.80:
+                            ocr_conf = det.get('ocr_conf', 0.0)
+                            if sightings < 2 and det['score'] < 0.72 and ocr_conf < 0.80:
                                 continue
                             worker['seen'][det['plate']] = now
 
                             # Save full vehicle crop for sighting photo
                             vbox = det.get('vehicle_bbox')
+                            crop = None
                             if vbox:
                                 vx1, vy1, vx2, vy2 = vbox
                                 crop = frame[max(0, vy1 - 15):min(frame.shape[0], vy2 + 15), max(0, vx1 - 15):min(frame.shape[1], vx2 + 15)]
-                            else:
+                            if crop is None or crop.size == 0:
                                 margin = int(max(w, h) * 1.4)
                                 crop = frame[max(0, y - margin):min(frame.shape[0], y + h + margin), max(0, x - margin):min(frame.shape[1], x + w + margin)]
+                            if crop is None or crop.size == 0:
+                                continue
 
+                            plate_crop = frame[max(0, y - 8):min(frame.shape[0], y + h + 8), max(0, x - 8):min(frame.shape[1], x + w + 8)]
                             ok, photo = cv2.imencode('.jpg', crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                            ok2, plate_img = cv2.imencode('.jpg', frame[max(0, y - 8):min(frame.shape[0], y + h + 8), max(0, x - 8):min(frame.shape[1], x + w + 8)], [cv2.IMWRITE_JPEG_QUALITY, 90])
+                            ok2 = plate_crop is not None and plate_crop.size > 0
+                            plate_img = None
+                            if ok2:
+                                ok2, plate_img = cv2.imencode('.jpg', plate_crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
                             if ok:
-                                self.store.save_sighting(stream, det['plate'], det['score'], now_ms,
-                                                         photo.tobytes(), plate_img.tobytes() if ok2 else None)
-                                self.stats['sightings'] += 1
+                                v_type = normalize_vehicle_type(det.get('vehicle_name'))
+                                pending_sightings.append((stream, det['plate'], det['score'], now_ms,
+                                                          photo.tobytes(), plate_img.tobytes() if ok2 else None, v_type))
+                        dev_cfg = dev_map.get(stream, {})
+                        dev_role = (dev_cfg.get('role') or 'checkpoint').lower()
+                        dev_count_enabled = bool(dev_cfg.get('count_enabled', True))
+                        dev_gate_group = dev_cfg.get('gate_group', '')
+                        track_db_ops = self._update_tracks_and_collect_ops(
+                            worker, stream, dev_role, dev_count_enabled,
+                            vehicles, detections, frame.shape, now, now_ms
+                        )
                         worker['meta'].update(scan_ms=round(scan_ms, 1), plates=len(detections),
                                               frame_age_ms=round((time.monotonic() - captured) * 1000))
                         self.stats['scans'] += 1
+
+                    # Execute SQLite writes outside engine.lock so MJPEG streaming never stalls
+                    for args in pending_sightings:
+                        self.store.save_sighting(*args)
+                        self.stats['sightings'] += 1
+                    for op in track_db_ops:
+                        if op[0] == 'insert':
+                            _, tid, direction, v_type, plate, conf, first_ts = op
+                            row_id, _ = self.store.record_vehicle_count(
+                                stream, direction, v_type, plate, tid, conf, first_ts,
+                                dedup_gap_ms=dedup_gap_ms, gate_group=dev_gate_group, gate_dedup_ms=gate_dedup_ms
+                            )
+                            with self.lock:
+                                if stream in self.workers and tid in self.workers[stream].get('tracks', {}):
+                                    self.workers[stream]['tracks'][tid]['db_id'] = row_id
+                        elif op[0] == 'update':
+                            _, tid, row_id, v_type, plate = op
+                            new_id = self.store.update_vehicle_count(
+                                row_id, v_type, plate, dedup_gap_ms=dedup_gap_ms, gate_dedup_ms=gate_dedup_ms
+                            )
+                            if new_id != row_id:
+                                with self.lock:
+                                    if stream in self.workers and tid in self.workers[stream].get('tracks', {}):
+                                        self.workers[stream]['tracks'][tid]['db_id'] = new_id
+
                     with self.lock:
                         if stream in self.workers:
                             worker['active_boxes'] = (vehicles, detections)
@@ -1290,6 +1990,76 @@ class Handler(BaseHTTPRequestHandler):
             if path_str == '/passages':
                 hours = min(720, max(1, float(query.get('hours', ['24'])[0])))
                 return self.send_json(200, {'passages': self.store.passages(int(time.time() * 1000 - hours * 3600000))})
+            if path_str == '/vehicle-counts':
+                now_ms = int(time.time() * 1000)
+                from_q = query.get('from_ts', [None])[0]
+                to_q = query.get('to_ts', [None])[0]
+                hours_q = query.get('hours', ['24'])[0]
+                granularity = query.get('granularity', ['hourly'])[0]
+                limit_q = min(500, max(10, int(query.get('limit', ['60'])[0])))
+                if from_q is not None:
+                    from_ts = max(0, int(float(from_q)))
+                    to_ts = int(float(to_q)) if to_q is not None else now_ms
+                elif str(hours_q).lower() in ('all', '0'):
+                    from_ts = 0
+                    to_ts = now_ms
+                elif str(hours_q).lower() == 'today':
+                    now_sec = int(time.time())
+                    seconds_today_in_ist = (now_sec + IST_OFFSET_SEC) % 86400
+                    from_ts = (now_sec - seconds_today_in_ist) * 1000
+                    to_ts = now_ms
+                else:
+                    hours_val = max(0.25, float(hours_q))
+                    from_ts = int(now_ms - hours_val * 3600000)
+                    to_ts = now_ms
+                summary = self.store.vehicle_counts_summary(from_ts=from_ts, to_ts=to_ts, granularity=granularity, event_limit=limit_q)
+                summary['remaining_cameras_live'] = self.engine.remaining_cameras_live()
+                return self.send_json(200, summary)
+            if path_str in ('/vehicle-counts.csv', '/vehicle-counts/export'):
+                now_ms = int(time.time() * 1000)
+                from_q = query.get('from_ts', [None])[0]
+                to_q = query.get('to_ts', [None])[0]
+                hours_q = query.get('hours', ['all'])[0]
+                direction = query.get('direction', [None])[0]
+                vtype_q = query.get('type', [None])[0]
+                if from_q is not None:
+                    from_ts = max(0, int(float(from_q)))
+                    to_ts = int(float(to_q)) if to_q is not None else now_ms
+                elif str(hours_q).lower() in ('all', '0'):
+                    from_ts = 0
+                    to_ts = now_ms
+                elif str(hours_q).lower() == 'today':
+                    now_sec = int(time.time())
+                    from_ts = (now_sec - (now_sec + IST_OFFSET_SEC) % 86400) * 1000
+                    to_ts = now_ms
+                else:
+                    from_ts = int(now_ms - max(0.25, float(hours_q)) * 3600000)
+                    to_ts = now_ms
+                events = self.store.vehicle_counts_events(from_ts=from_ts, to_ts=to_ts, direction=direction, vehicle_type=vtype_q, limit=10000)
+                import csv, io
+                out = io.StringIO()
+                writer = csv.writer(out)
+                writer.writerow(['S.No', 'Date & Time (IST)', 'Direction', 'Gate / Camera', 'Gate Group', 'Matched Cameras', 'Vehicle Type', 'Plate (If Read)', 'Confidence'])
+                for idx, ev in enumerate(events, 1):
+                    writer.writerow([
+                        idx,
+                        to_ist_strftime(ev['ts'] / 1000),
+                        ev['direction'].upper(),
+                        ev['camera'],
+                        ev.get('gate_group') or 'Default',
+                        ', '.join(ev.get('merged_cameras') or [ev['camera']]),
+                        ev['vehicle_type'].upper(),
+                        ev['plate'] or '—',
+                        f"{int(round((ev['confidence'] or 0) * 100))}%" if ev.get('confidence') is not None else '—'
+                    ])
+                payload = out.getvalue().encode('utf-8-sig')
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/csv; charset=utf-8')
+                self.send_header('Content-Disposition', 'attachment; filename="Medanta_Gate_Vehicle_Counts_' + to_ist_strftime(time.time(), '%Y%m%d_%H%M%S') + '.csv"')
+                self.send_header('Content-Length', str(len(payload)))
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                return self.wfile.write(payload)
             if path_str == '/analytics':
                 hours = min(720, max(1, float(query.get('hours', ['24'])[0])))
                 since = int(time.time() * 1000 - hours * 3600000)
@@ -1434,7 +2204,9 @@ class Handler(BaseHTTPRequestHandler):
                     anpr=data.get('anpr', True),
                     url=data.get('url', ''),
                     masks=data.get('masks'),
-                    enabled=data.get('enabled', True)
+                    enabled=data.get('enabled', True),
+                    gate_group=data.get('gate_group', ''),
+                    count_enabled=data.get('count_enabled', True)
                 )
                 self.engine.drop(device['stream'])
                 self.engine.sync()

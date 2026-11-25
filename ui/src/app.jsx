@@ -406,6 +406,8 @@ function AddCameraModal({ open, onClose, onAdd }) {
   const [name, setName] = useState('');
   const [role, setRole] = useState('checkpoint');
   const [anpr, setAnpr] = useState(true);
+  const [gateGroup, setGateGroup] = useState('');
+  const [countEnabled, setCountEnabled] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
@@ -433,10 +435,18 @@ function AddCameraModal({ open, onClose, onAdd }) {
     setBusy(true);
     setError('');
     try {
-      const result = await api('/devices', { stream, url: url.trim(), name: name.trim() || stream, role, anpr });
+      const result = await api('/devices', {
+        stream,
+        url: url.trim(),
+        name: name.trim() || stream,
+        role,
+        anpr,
+        gate_group: gateGroup.trim(),
+        count_enabled: countEnabled
+      });
       if (result.error) throw new Error(result.error);
       onAdd(result);
-      setUrl(''); setName(''); setRole('checkpoint'); setAnpr(true);
+      setUrl(''); setName(''); setRole('checkpoint'); setAnpr(true); setGateGroup(''); setCountEnabled(true);
       onClose();
     } catch (err) {
       setError(err.message);
@@ -483,6 +493,25 @@ function AddCameraModal({ open, onClose, onAdd }) {
                 ANPR Enabled
               </label>
             </div>
+            {(role === 'entry' || role === 'exit') && (
+              <div style={{ padding: '10px 12px', background: '#f8fafd', border: '1px solid #e1e7f0', borderRadius: 8, marginBottom: 12 }}>
+                <div className="field" style={{ marginBottom: 8 }}>
+                  <span>Gate / Location Group (Optional)</span>
+                  <input
+                    placeholder="e.g. Main Gate (blank = auto-dedup all same-role cameras)"
+                    value={gateGroup}
+                    onChange={e => setGateGroup(e.target.value)}
+                  />
+                  <small style={{ color: '#64748b', fontSize: 10 }}>
+                    Cameras with the same Role &amp; Group merge into 1 physical vehicle count.
+                  </small>
+                </div>
+                <label className="check">
+                  <input type="checkbox" checked={countEnabled} onChange={e => setCountEnabled(e.target.checked)} />
+                  Save counts to Gate History DB (uncheck for Live-Only ANPR)
+                </label>
+              </div>
+            )}
             <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 16 }}>
               <button type="button" className="btn" onClick={onClose}>Cancel</button>
               <button type="submit" className="btn primary" disabled={busy}>
@@ -503,6 +532,8 @@ function EditCameraModal({ device, open, onClose, onSave, onDelete }) {
   const [url, setUrl] = useState(device?.url || '');
   const [role, setRole] = useState(device?.role || 'checkpoint');
   const [anpr, setAnpr] = useState(device?.anpr ?? true);
+  const [gateGroup, setGateGroup] = useState(device?.gate_group || '');
+  const [countEnabled, setCountEnabled] = useState(device?.count_enabled ?? true);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -511,6 +542,8 @@ function EditCameraModal({ device, open, onClose, onSave, onDelete }) {
       setUrl(device.url || '');
       setRole(device.role);
       setAnpr(device.anpr);
+      setGateGroup(device.gate_group || '');
+      setCountEnabled(device.count_enabled ?? true);
     }
   }, [device]);
 
@@ -519,7 +552,15 @@ function EditCameraModal({ device, open, onClose, onSave, onDelete }) {
   const handleSave = async () => {
     setBusy(true);
     try {
-      await api('/devices', { stream: device.stream, url: url.trim(), name, role, anpr });
+      await api('/devices', {
+        stream: device.stream,
+        url: url.trim(),
+        name,
+        role,
+        anpr,
+        gate_group: gateGroup.trim(),
+        count_enabled: countEnabled
+      });
       onSave();
     } finally {
       setBusy(false);
@@ -570,6 +611,25 @@ function EditCameraModal({ device, open, onClose, onSave, onDelete }) {
               ANPR Enabled
             </label>
           </div>
+          {(role === 'entry' || role === 'exit') && (
+            <div style={{ padding: '10px 12px', background: '#f8fafd', border: '1px solid #e1e7f0', borderRadius: 8, marginBottom: 12 }}>
+              <div className="field" style={{ marginBottom: 8 }}>
+                <span>Gate / Location Group (Optional)</span>
+                <input
+                  placeholder="e.g. Main Gate (blank = auto-dedup all same-role cameras)"
+                  value={gateGroup}
+                  onChange={e => setGateGroup(e.target.value)}
+                />
+                <small style={{ color: '#64748b', fontSize: 10 }}>
+                  Cameras with the same Role &amp; Group merge into 1 physical vehicle count.
+                </small>
+              </div>
+              <label className="check">
+                <input type="checkbox" checked={countEnabled} onChange={e => setCountEnabled(e.target.checked)} />
+                Save counts to Gate History DB (uncheck for Live-Only ANPR)
+              </label>
+            </div>
+          )}
           <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 16 }}>
             <button className="btn danger" onClick={handleDelete} disabled={busy}>Remove</button>
             <button className="btn" onClick={onClose}>Cancel</button>
@@ -606,6 +666,16 @@ function RegisteredCameras({ devices, activeSlots, onToggleViewSlot, onEditCamer
                 </small>
               </div>
               <span className={`badge ${d.role}`} style={{ fontSize: 8 }}>{d.role}</span>
+              {(d.role === 'entry' || d.role === 'exit') && d.gate_group && (
+                <span className="badge" style={{ background: '#e0e7ff', color: '#3730a3', fontSize: 8 }} title={`Gate Group: ${d.gate_group}`}>
+                  {d.gate_group}
+                </span>
+              )}
+              {(d.role === 'entry' || d.role === 'exit') && d.count_enabled === false && (
+                <span className="badge" style={{ background: '#fef3c7', color: '#92400e', fontSize: 8 }} title="Excluded from Gate DB counts (Live-Only)">
+                  Live Only
+                </span>
+              )}
               {inView && (
                 <span className="badge" style={{ background: 'var(--primary-100)', color: 'var(--primary-600)', fontSize: 8 }}>
                   Slot {slotIdx + 1}
@@ -1191,12 +1261,473 @@ function GateAnalyticsCard({ analytics, devices, timeFilter, setTimeFilter }) {
   );
 }
 
+/* ── Security Gate Vehicle Counts (Incoming/Outgoing DB + Remaining Live) ── */
+
+const VEHICLE_TYPE_META = [
+  { key: 'car', label: 'Cars', icon: '🚗', color: '#235496', bg: '#eaf1fa' },
+  { key: 'bike', label: 'Bikes', icon: '🏍️', color: '#6932b5', bg: '#f3effc' },
+  { key: 'auto', label: 'Autos', icon: '🛺', color: '#147a6d', bg: '#e7f7f4' },
+  { key: 'ambulance', label: 'Ambulances', icon: '🚑', color: '#b82323', bg: '#feebeb' },
+];
+
+function SecurityVehicleCountsCard({
+  data, range, setRange, customStart, setCustomStart, customEnd, setCustomEnd, onOpenHistory
+}) {
+  const incoming = data?.incoming || { car: 0, bike: 0, auto: 0, ambulance: 0, total: 0 };
+  const outgoing = data?.outgoing || { car: 0, bike: 0, auto: 0, ambulance: 0, total: 0 };
+  const allTime = data?.all_time || {};
+  const remaining = data?.remaining_cameras_live || [];
+  const totalNet = (incoming.total || 0) - (outgoing.total || 0);
+
+  return (
+    <>
+      {/* 1. Saved Incoming & Outgoing Security Counts Card */}
+      <div className="card">
+        <div className="head" style={{ flexWrap: 'wrap', gap: 8 }}>
+          <div>
+            <h3>🛡️ Gate Vehicle Counts</h3>
+            <small>Incoming &amp; Outgoing • Saved in Database</small>
+          </div>
+        </div>
+
+        <div className="body" style={{ padding: '12px 16px' }}>
+          {/* Historical Range Quick Switcher */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap', marginBottom: 10 }}>
+            {[
+              { k: '1h', label: '1h' },
+              { k: 'today', label: 'Today' },
+              { k: '24h', label: '24h' },
+              { k: '7d', label: '7d' },
+              { k: 'all', label: 'All Time' },
+              { k: 'custom', label: '📅 Custom' },
+            ].map(item => (
+              <button
+                key={item.k}
+                type="button"
+                className={`vc-range-btn ${range === item.k ? 'active' : ''}`}
+                onClick={() => setRange(item.k)}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+
+          {range === 'custom' && (
+            <div style={{ display: 'grid', gap: 6, padding: 8, background: '#f8fafd', border: '1px solid #e1e7f0', borderRadius: 8, marginBottom: 10 }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6 }}>
+                <span style={{ fontSize: 10, fontWeight: 700, color: '#5d7089' }}>From:</span>
+                <input
+                  type="datetime-local"
+                  value={customStart}
+                  onChange={e => setCustomStart(e.target.value)}
+                  style={{ flex: 1, fontSize: 10, padding: '3px 6px', border: '1px solid #dfe6f0', borderRadius: 5 }}
+                />
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6 }}>
+                <span style={{ fontSize: 10, fontWeight: 700, color: '#5d7089' }}>To:</span>
+                <input
+                  type="datetime-local"
+                  value={customEnd}
+                  onChange={e => setCustomEnd(e.target.value)}
+                  style={{ flex: 1, fontSize: 10, padding: '3px 6px', border: '1px solid #dfe6f0', borderRadius: 5 }}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* Incoming vs Outgoing Breakdown Table */}
+          <table className="vc-matrix">
+            <thead>
+              <tr>
+                <th>Vehicle Type</th>
+                <th className="num">🟢 Incoming</th>
+                <th className="num">🔵 Outgoing</th>
+                <th className="num">Net</th>
+              </tr>
+            </thead>
+            <tbody>
+              {VEHICLE_TYPE_META.map(vt => {
+                const inCnt = incoming[vt.key] || 0;
+                const outCnt = outgoing[vt.key] || 0;
+                const net = inCnt - outCnt;
+                return (
+                  <tr key={vt.key} style={vt.key === 'ambulance' ? { background: '#fffafa' } : undefined}>
+                    <td>
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                        <span>{vt.icon}</span>
+                        <span style={{ fontWeight: 700, color: vt.key === 'ambulance' ? '#991b1b' : '#1e293b' }}>
+                          {vt.label}
+                        </span>
+                      </span>
+                    </td>
+                    <td className="num"><span className="vc-pill in">{inCnt}</span></td>
+                    <td className="num"><span className="vc-pill out">{outCnt}</span></td>
+                    <td className="num">
+                      <span className={`vc-pill ${net > 0 ? 'net-pos' : 'net-zero'}`}>
+                        {net > 0 ? `+${net}` : net}
+                      </span>
+                    </td>
+                  </tr>
+                );
+              })}
+              <tr style={{ background: '#f8fafc' }}>
+                <td style={{ fontWeight: 800, color: '#0f172a' }}>Total Gate Flow</td>
+                <td className="num"><b style={{ color: '#15803d', fontSize: 12 }}>{incoming.total || 0}</b></td>
+                <td className="num"><b style={{ color: '#1d4ed8', fontSize: 12 }}>{outgoing.total || 0}</b></td>
+                <td className="num"><b style={{ color: '#334155', fontSize: 12 }}>{totalNet > 0 ? `+${totalNet}` : totalNet}</b></td>
+              </tr>
+            </tbody>
+          </table>
+
+          {/* Footer: All-Time DB Summary + History Modal Trigger */}
+          <div style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            gap: 8, marginTop: 12, paddingTop: 10, borderTop: '1px solid #eef2f7', flexWrap: 'wrap'
+          }}>
+            <small style={{ fontSize: 10, color: '#64748b', fontWeight: 600 }}>
+              All-time DB: <b>{allTime.incoming?.total || 0}</b> in • <b>{allTime.outgoing?.total || 0}</b> out
+            </small>
+            <button type="button" className="btn sm primary" onClick={onOpenHistory} style={{ padding: '5px 10px' }}>
+              📜 Historical Records
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* 2. Remaining Cameras — Live Only (Never Saved to DB) */}
+      <div className="card">
+        <div className="head" style={{ flexWrap: 'wrap', gap: 8 }}>
+          <div>
+            <h3>📡 Other Cameras (Live Only)</h3>
+            <small>Checkpoint &amp; internal live detections</small>
+          </div>
+        </div>
+        <div className="body" style={{ padding: '12px 16px', display: 'grid', gap: 10 }}>
+          {remaining.map(cam => {
+            const inf = cam.in_frame || { car: 0, bike: 0, auto: 0, ambulance: 0, total: 0 };
+            const sess = cam.session || { car: 0, bike: 0, auto: 0, ambulance: 0, total: 0 };
+            return (
+              <div key={cam.stream} className="vc-live-row">
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+                    <span
+                      style={{
+                        width: 8, height: 8, borderRadius: '50%', flex: 'none',
+                        background: cam.online ? '#10b981' : '#94a3b8',
+                        boxShadow: cam.online ? '0 0 0 3px rgba(16,185,129,0.2)' : 'none'
+                      }}
+                    />
+                    <b style={{ fontSize: 12, color: '#1e293b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {cam.name}
+                    </b>
+                    <span className={`badge ${cam.role}`} style={{ fontSize: 8 }}>{cam.role}</span>
+                    {(cam.role === 'entry' || cam.role === 'exit') && cam.count_enabled === false && (
+                      <span className="badge" style={{ background: '#fef3c7', color: '#92400e', fontSize: 8 }}>DB Off</span>
+                    )}
+                  </div>
+                  <span style={{ fontSize: 10, fontWeight: 700, color: cam.online ? '#059669' : '#94a3b8' }}>
+                    {cam.online ? `${inf.total} in frame` : 'Offline'}
+                  </span>
+                </div>
+
+                <div className="vc-mini-grid">
+                  {VEHICLE_TYPE_META.map(vt => (
+                    <div key={vt.key} className="vc-mini-chip" title={`In view: ${inf[vt.key] || 0} | Live session tracked: ${sess[vt.key] || 0}`}>
+                      <span>{vt.icon} {vt.label}</span>
+                      <b>{inf[vt.key] || 0}</b>
+                      <span style={{ fontSize: 8, color: '#94a3b8', marginTop: 1 }}>sess: {sess[vt.key] || 0}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+          {remaining.length === 0 && (
+            <div className="empty" style={{ padding: 12 }}>
+              All registered Entry &amp; Exit cameras are saving directly to Gate History.
+            </div>
+          )}
+        </div>
+      </div>
+    </>
+  );
+}
+
+/* ── Historical Incoming & Outgoing Security Modal ─────────── */
+
+function VehicleHistoryModal({ open, onClose, initialData }) {
+  const [histRange, setHistRange] = useState('24h');
+  const [fromStr, setFromStr] = useState(() => {
+    const d = new Date(Date.now() - 7 * 86400000);
+    return d.toISOString().slice(0, 16);
+  });
+  const [toStr, setToStr] = useState(() => new Date().toISOString().slice(0, 16));
+  const [granularity, setGranularity] = useState('hourly');
+  const [dirFilter, setDirFilter] = useState('all');
+  const [typeFilter, setTypeFilter] = useState('all');
+  const [histData, setHistData] = useState(initialData || null);
+  const [loading, setLoading] = useState(false);
+
+  const fetchHistory = useCallback(async () => {
+    if (!open) return;
+    setLoading(true);
+    try {
+      let qs = `granularity=${granularity}&limit=200`;
+      if (histRange === 'custom') {
+        const fMs = new Date(fromStr).getTime() || 0;
+        const tMs = new Date(toStr).getTime() || Date.now();
+        qs += `&from_ts=${fMs}&to_ts=${tMs}`;
+      } else {
+        qs += `&hours=${histRange === '7d' ? '168' : histRange === '30d' ? '720' : histRange === '24h' ? '24' : histRange}`;
+      }
+      const res = await api('/vehicle-counts?' + qs);
+      setHistData(res);
+    } catch (e) {
+      console.error('Failed to load historical vehicle counts:', e);
+    } finally {
+      setLoading(false);
+    }
+  }, [open, histRange, fromStr, toStr, granularity]);
+
+  useEffect(() => {
+    fetchHistory();
+  }, [fetchHistory]);
+
+  useEffect(() => {
+    if (!open) return;
+    const handleKey = (e) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  const incoming = histData?.incoming || { car: 0, bike: 0, auto: 0, ambulance: 0, total: 0 };
+  const outgoing = histData?.outgoing || { car: 0, bike: 0, auto: 0, ambulance: 0, total: 0 };
+  const byCamera = histData?.by_camera || [];
+  const historyRows = [...(histData?.history || [])].reverse();
+  const events = (histData?.recent_events || []).filter(ev => {
+    if (dirFilter !== 'all' && ev.direction !== dirFilter) return false;
+    if (typeFilter !== 'all' && ev.vehicle_type !== typeFilter) return false;
+    return true;
+  });
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-box" style={{ width: 920, maxWidth: '95vw', maxHeight: '90vh', display: 'flex', flexDirection: 'column' }} onClick={e => e.stopPropagation()}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '15px 20px', borderBottom: '1px solid #eef2f7', background: '#fbfcfe' }}>
+          <div>
+            <h3 style={{ margin: 0, fontSize: 16, fontWeight: 800, color: '#172138' }}>
+              🛡️ Historical Gate Vehicle Counts &amp; Security Audit Log
+            </h3>
+            <small style={{ color: '#8ca0bc', fontSize: 11 }}>
+              Incoming &amp; outgoing vehicle breakdown saved permanently in database
+            </small>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <button className="btn sm" onClick={onClose} style={{ borderRadius: '50%', width: 30, height: 30, padding: 0 }}>✕</button>
+          </div>
+        </div>
+
+        {/* Filter Bar */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 20px', background: '#f8fafd', borderBottom: '1px solid #eef2f7', flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+            {[
+              { k: 'today', label: 'Today' },
+              { k: '24h', label: '24h' },
+              { k: '7d', label: '7 Days' },
+              { k: '30d', label: '30 Days' },
+              { k: 'all', label: 'All Time' },
+              { k: 'custom', label: '📅 Custom' },
+            ].map(b => (
+              <button key={b.k} type="button" className={`vc-range-btn ${histRange === b.k ? 'active' : ''}`} onClick={() => setHistRange(b.k)}>
+                {b.label}
+              </button>
+            ))}
+          </div>
+          <select value={granularity} onChange={e => setGranularity(e.target.value)} style={{ padding: '4px 8px', border: '1px solid #dfe6f0', borderRadius: 6, fontSize: 11, fontWeight: 700 }}>
+            <option value="hourly">Hourly Buckets</option>
+            <option value="daily">Daily Buckets</option>
+          </select>
+          <select value={dirFilter} onChange={e => setDirFilter(e.target.value)} style={{ padding: '4px 8px', border: '1px solid #dfe6f0', borderRadius: 6, fontSize: 11, fontWeight: 700 }}>
+            <option value="all">All Directions</option>
+            <option value="incoming">🟢 Incoming Only</option>
+            <option value="outgoing">🔵 Outgoing Only</option>
+          </select>
+          <select value={typeFilter} onChange={e => setTypeFilter(e.target.value)} style={{ padding: '4px 8px', border: '1px solid #dfe6f0', borderRadius: 6, fontSize: 11, fontWeight: 700 }}>
+            <option value="all">All Vehicle Types</option>
+            <option value="car">🚗 Cars</option>
+            <option value="bike">🏍️ Bikes</option>
+            <option value="auto">🛺 Autos</option>
+            <option value="ambulance">🚑 Ambulances</option>
+          </select>
+          {loading && <span style={{ fontSize: 11, color: '#206e69', fontWeight: 700 }}>Refreshing…</span>}
+        </div>
+
+        {histRange === 'custom' && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 20px', background: '#f0f9f5', borderBottom: '1px solid #cce8de', flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 11, fontWeight: 700, color: '#17835c' }}>Custom Window:</span>
+            <input type="datetime-local" value={fromStr} onChange={e => setFromStr(e.target.value)} style={{ border: '1px solid #bfe2d4', borderRadius: 6, fontSize: 11, padding: '3px 6px' }} />
+            <span style={{ fontSize: 11, color: '#64748b' }}>to</span>
+            <input type="datetime-local" value={toStr} onChange={e => setToStr(e.target.value)} style={{ border: '1px solid #bfe2d4', borderRadius: 6, fontSize: 11, padding: '3px 6px' }} />
+          </div>
+        )}
+
+        <div style={{ padding: 20, overflowY: 'auto', display: 'grid', gap: 18 }}>
+          {/* Summary Totals Grid */}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 10 }}>
+            {VEHICLE_TYPE_META.map(vt => (
+              <div key={vt.key} style={{ background: vt.bg, border: '1px solid #e2e8f0', borderRadius: 10, padding: '10px 14px' }}>
+                <div style={{ fontSize: 11, fontWeight: 800, color: vt.color }}>{vt.icon} {vt.label.toUpperCase()}</div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 6, fontSize: 12 }}>
+                  <span>In: <b style={{ color: '#15803d' }}>{incoming[vt.key] || 0}</b></span>
+                  <span>Out: <b style={{ color: '#1d4ed8' }}>{outgoing[vt.key] || 0}</b></span>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* Per-Gate Breakdown */}
+          {byCamera.length > 0 && (
+            <div>
+              <h4 style={{ margin: '0 0 8px', fontSize: 12, color: '#334155', textTransform: 'uppercase', letterSpacing: .4 }}>Gate-wise Breakdown</h4>
+              <table className="vc-matrix" style={{ border: '1px solid #eef2f7', borderRadius: 8 }}>
+                <thead style={{ background: '#f8fafd' }}>
+                  <tr>
+                    <th>Gate Camera</th>
+                    <th>Direction</th>
+                    <th className="num">🚗 Car</th>
+                    <th className="num">🏍️ Bike</th>
+                    <th className="num">🛺 Auto</th>
+                    <th className="num">🚑 Ambulance</th>
+                    <th className="num">Total</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {byCamera.map((c, idx) => (
+                    <tr key={c.stream + idx}>
+                      <td><b>{c.name}</b></td>
+                      <td><span className={`vc-pill ${c.direction === 'incoming' ? 'in' : 'out'}`}>{c.direction.toUpperCase()}</span></td>
+                      <td className="num">{c.car}</td>
+                      <td className="num">{c.bike}</td>
+                      <td className="num">{c.auto}</td>
+                      <td className="num">{c.ambulance}</td>
+                      <td className="num"><b>{c.total}</b></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {/* Time-Bucket History Table */}
+          <div>
+            <h4 style={{ margin: '0 0 8px', fontSize: 12, color: '#334155', textTransform: 'uppercase', letterSpacing: .4 }}>
+              {histData?.window?.granularity === 'daily' ? 'Daily' : 'Hourly'} Incoming &amp; Outgoing Breakdown
+            </h4>
+            {historyRows.length > 0 ? (
+              <div style={{ maxHeight: 210, overflowY: 'auto', border: '1px solid #eef2f7', borderRadius: 8 }}>
+                <table className="vc-matrix" style={{ marginTop: 0 }}>
+                  <thead style={{ position: 'sticky', top: 0, background: '#f8fafd' }}>
+                    <tr>
+                      <th>Time Period (IST)</th>
+                      <th className="num">In (Car / Bike / Auto / Amb)</th>
+                      <th className="num">🟢 In Total</th>
+                      <th className="num">Out (Car / Bike / Auto / Amb)</th>
+                      <th className="num">🔵 Out Total</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {historyRows.map(b => {
+                      const d = new Date(b.bucket);
+                      const lbl = histData?.window?.granularity === 'daily'
+                        ? d.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric' })
+                        : d.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: true });
+                      const i = b.incoming, o = b.outgoing;
+                      return (
+                        <tr key={b.bucket}>
+                          <td>{lbl}</td>
+                          <td className="num">{i.car} / {i.bike} / {i.auto} / {i.ambulance}</td>
+                          <td className="num"><span className="vc-pill in">{i.total}</span></td>
+                          <td className="num">{o.car} / {o.bike} / {o.auto} / {o.ambulance}</td>
+                          <td className="num"><span className="vc-pill out">{o.total}</span></td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="empty" style={{ border: '1px solid #eef2f7', borderRadius: 8 }}>No historical gate vehicle records in this selected window yet.</div>
+            )}
+          </div>
+
+          {/* Detailed Security Audit Events */}
+          <div>
+            <h4 style={{ margin: '0 0 8px', fontSize: 12, color: '#334155', textTransform: 'uppercase', letterSpacing: .4 }}>
+              Recent Tracked Gate Events ({events.length})
+            </h4>
+            {events.length > 0 ? (
+              <div style={{ maxHeight: 220, overflowY: 'auto', border: '1px solid #eef2f7', borderRadius: 8 }}>
+                <table className="vc-matrix" style={{ marginTop: 0 }}>
+                  <thead style={{ position: 'sticky', top: 0, background: '#f8fafd' }}>
+                    <tr>
+                      <th>Time (IST)</th>
+                      <th>Direction</th>
+                      <th>Gate Camera</th>
+                      <th>Type</th>
+                      <th>Plate (If Read)</th>
+                      <th className="num">Conf</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {events.map(ev => {
+                      const extraCams = (ev.merged_cameras && ev.merged_cameras.length > 1) ? ev.merged_cameras.length - 1 : 0;
+                      return (
+                        <tr key={ev.id}>
+                          <td style={{ whiteSpace: 'nowrap' }}>{tsDate(ev.ts)}</td>
+                          <td><span className={`vc-pill ${ev.direction === 'incoming' ? 'in' : 'out'}`}>{ev.direction.toUpperCase()}</span></td>
+                          <td>
+                            <span>{ev.camera}</span>
+                            {extraCams > 0 && (
+                              <span
+                                className="badge"
+                                style={{ marginLeft: 5, background: '#dcfce7', color: '#166534', fontSize: 8 }}
+                                title={`Merged across ${ev.merged_cameras.join(', ')}`}
+                              >
+                                +{extraCams} cam
+                              </span>
+                            )}
+                            {ev.gate_group && (
+                              <span style={{ marginLeft: 5, fontSize: 9, color: '#64748b' }}>({ev.gate_group})</span>
+                            )}
+                          </td>
+                          <td style={{ textTransform: 'capitalize' }}>{ev.vehicle_type}</td>
+                          <td><b>{ev.plate || '—'}</b></td>
+                          <td className="num">{ev.confidence != null ? `${Math.round(ev.confidence * 100)}%` : '—'}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="empty" style={{ border: '1px solid #eef2f7', borderRadius: 8 }}>No tracked events matching filter.</div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ── Journey Rules Panel ──────────────────────────────────── */
 
 function RulesPanel({ rules, onUpdate }) {
   const [visitGap, setVisitGap] = useState(rules?.visit_gap_min ?? 30);
   const [exitGrace, setExitGrace] = useState(rules?.exit_grace_min ?? 45);
   const [correlateWindow, setCorrelateWindow] = useState(rules?.correlate_window_s ?? 300);
+  const [gateDedupS, setGateDedupS] = useState(rules?.gate_dedup_s ?? 15);
   const [correlatePassages, setCorrelatePassages] = useState(rules?.correlate_passages ?? true);
   const [busy, setBusy] = useState(false);
 
@@ -1205,6 +1736,7 @@ function RulesPanel({ rules, onUpdate }) {
       setVisitGap(rules.visit_gap_min);
       setExitGrace(rules.exit_grace_min);
       setCorrelateWindow(rules.correlate_window_s);
+      setGateDedupS(rules.gate_dedup_s ?? 15);
       setCorrelatePassages(rules.correlate_passages);
     }
   }, [rules]);
@@ -1216,6 +1748,7 @@ function RulesPanel({ rules, onUpdate }) {
         visit_gap_min: visitGap,
         exit_grace_min: exitGrace,
         correlate_window_s: correlateWindow,
+        gate_dedup_s: gateDedupS,
         correlate_passages: correlatePassages
       });
       onUpdate();
@@ -1248,6 +1781,16 @@ function RulesPanel({ rules, onUpdate }) {
           <input type="range" min={30} max={3600} step={30} value={correlateWindow} onChange={e => setCorrelateWindow(Number(e.target.value))} style={{ flex: 1 }} />
           <b style={{ fontSize: 12, minWidth: 40 }}>{correlateWindow}s</b>
         </div>
+      </div>
+      <div className="field" style={{ marginBottom: 14 }}>
+        <span>Multi-Camera Gate Dedup Window (seconds)</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <input type="range" min={0} max={120} step={1} value={gateDedupS} onChange={e => setGateDedupS(Number(e.target.value))} style={{ flex: 1 }} />
+          <b style={{ fontSize: 12, minWidth: 36 }}>{gateDedupS}s</b>
+        </div>
+        <small style={{ color: '#8ca0bc', fontSize: 10 }}>
+          Merges overlapping Entry/Exit cameras watching one physical gate (0s = exact plate only)
+        </small>
       </div>
       <label className="check">
         <input type="checkbox" checked={correlatePassages} onChange={e => setCorrelatePassages(e.target.checked)} />
@@ -1396,6 +1939,14 @@ function App() {
   // Modals
   const [fullscreenStream, setFullscreenStream] = useState(null);
   const [selectedSightingModal, setSelectedSightingModal] = useState(null);
+  const [vehicleCounts, setVehicleCounts] = useState(null);
+  const [vcRange, setVcRange] = useState('today');
+  const [vcCustomStart, setVcCustomStart] = useState(() => {
+    const d = new Date(Date.now() - 86400000);
+    return d.toISOString().slice(0, 16);
+  });
+  const [vcCustomEnd, setVcCustomEnd] = useState(() => new Date().toISOString().slice(0, 16));
+  const [historyModalOpen, setHistoryModalOpen] = useState(false);
 
   const devices = state?.devices || [];
   const rules = state?.rules;
@@ -1478,20 +2029,32 @@ function App() {
         const diffMs = Math.max(0, Date.now() - new Date(customStart).getTime());
         queryHours = Math.min(720, Math.max(1, Math.ceil(diffMs / 3600000)));
       }
-      const [stateData, analyticsData, journeyRes] = await Promise.all([
+      let vcQuery = 'hours=today';
+      if (vcRange === '1h') vcQuery = 'hours=1';
+      else if (vcRange === '24h') vcQuery = 'hours=24';
+      else if (vcRange === '7d') vcQuery = 'hours=168';
+      else if (vcRange === 'all') vcQuery = 'hours=all';
+      else if (vcRange === 'custom') {
+        const fMs = new Date(vcCustomStart).getTime() || 0;
+        const tMs = new Date(vcCustomEnd).getTime() || Date.now();
+        vcQuery = `from_ts=${fMs}&to_ts=${tMs}`;
+      }
+      const [stateData, analyticsData, journeyRes, vcRes] = await Promise.all([
         api('/state'),
         api('/analytics?hours=' + queryHours),
-        api('/journeys?hours=' + queryHours + (searchPlate ? '&plate=' + searchPlate : ''))
+        api('/journeys?hours=' + queryHours + (searchPlate ? '&plate=' + searchPlate : '')),
+        api('/vehicle-counts?' + vcQuery).catch(() => null)
       ]);
       if (stateData?.feed_mode) setFeedSource(stateData.feed_mode);
       setState(stateData);
       setAnalytics(analyticsData);
       setJourneyData(journeyRes.journeys || []);
+      if (vcRes) setVehicleCounts(vcRes);
       setError(null);
     } catch (err) {
       setError(err.message);
     }
-  }, [timeFilter, customStart, searchPlate]);
+  }, [timeFilter, customStart, searchPlate, vcRange, vcCustomStart, vcCustomEnd]);
 
   const handleToggleFeedSource = async () => {
     const nextMode = feedSource === 'demo' ? 'live' : 'demo';
@@ -2152,10 +2715,27 @@ function App() {
               />
             </div>
           </div>
+
+          {/* Gate Vehicle Type Breakdown (Saved DB History + Remaining Cameras Live Only) */}
+          <SecurityVehicleCountsCard
+            data={vehicleCounts}
+            range={vcRange}
+            setRange={setVcRange}
+            customStart={vcCustomStart}
+            setCustomStart={setVcCustomStart}
+            customEnd={vcCustomEnd}
+            setCustomEnd={setVcCustomEnd}
+            onOpenHistory={() => setHistoryModalOpen(true)}
+          />
         </div>
       </div>
 
       {/* ── Lightbox & Modals ── */}
+      <VehicleHistoryModal
+        open={historyModalOpen}
+        onClose={() => setHistoryModalOpen(false)}
+        initialData={vehicleCounts}
+      />
       <FullscreenModal
         stream={fullscreenStream}
         device={deviceMap[fullscreenStream]}

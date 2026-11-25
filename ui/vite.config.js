@@ -9,6 +9,10 @@ const TARGET = process.env.VEHICLE_API || 'http://124.123.89.162:31016';
 
 export default defineConfig({
   esbuild: { jsx: 'automatic', jsxImportSource: 'react' },
+  build: {
+    outDir: '../backend/dist',
+    emptyOutDir: true,
+  },
   server: {
     fs: { deny: ['.env', '.env.*', '**/.service-key', '**/.git/**'] }, proxy: {
       '/api': {
