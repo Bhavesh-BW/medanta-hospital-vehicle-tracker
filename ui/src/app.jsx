@@ -844,7 +844,6 @@ function getDeviceZone(device) {
 
 function GateAnalyticsCard({ analytics, devices, timeFilter, setTimeFilter }) {
   const [timelineMode, setTimelineMode] = useState('hourly'); // 'hourly' | 'daily'
-  const [timelineOffset, setTimelineOffset] = useState(0); // 0 = latest hours
   const perCamera = analytics?.per_camera || {};
 
   const entryDevices = (devices || []).filter(d => d.role === 'entry');
@@ -878,23 +877,19 @@ function GateAnalyticsCard({ analytics, devices, timeFilter, setTimeFilter }) {
   const isDaily = timelineMode === 'daily' || timeFilter === '7d';
   const timelineItems = isDaily ? dailyEntries : hourly;
 
-  // Pagination for timeline: 5 items per view window with ◀ Earlier and Later ▶ controls
-  const WINDOW_SIZE = 5;
-  const totalItems = timelineItems.length;
-  const clampedOffset = Math.min(Math.max(0, timelineOffset), Math.max(0, totalItems - WINDOW_SIZE));
-  const endIndex = Math.max(0, totalItems - clampedOffset);
-  const startIndex = Math.max(0, endIndex - WINDOW_SIZE);
-  const visibleItems = timelineItems.slice(startIndex, endIndex);
-
-  const canGoEarlier = startIndex > 0;
-  const canGoLater = clampedOffset > 0;
-
-  const maxPeak = Math.max(...visibleItems.map(item => item.count), 1);
-
-  // Reset offset when mode or filter changes
-  useEffect(() => {
-    setTimelineOffset(0);
-  }, [timeFilter, timelineMode]);
+  const maxPeak = Math.max(...timelineItems.map(item => item.count), 1);
+  const windowTotal = timelineItems.reduce((acc, item) => acc + (item.count || 0), 0);
+  const windowAvg = timelineItems.length > 0 ? Math.round(windowTotal / timelineItems.length) : 0;
+  const normalizedBars = timelineItems.map(item => {
+    const label = isDaily
+      ? item.dayLabel
+      : new Date(item.bucket).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: 'numeric', hour12: true });
+    return {
+      key: isDaily ? item.dayLabel : item.bucket,
+      label,
+      count: item.count || 0
+    };
+  });
 
   return (
     <div className="card">
@@ -1109,21 +1104,24 @@ function GateAnalyticsCard({ analytics, devices, timeFilter, setTimeFilter }) {
           </div>
         </div>
 
-        {/* Hourly vs Daily Traffic Volume Timeline with Scroll / Shift Navigation */}
-        {((isDaily && dailyEntries.length > 0) || (!isDaily && hourly.length > 0)) && (
-          <div style={{ marginTop: 18, background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 10, padding: '14px 16px' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14, flexWrap: 'wrap', gap: 10 }}>
+        {/* Hourly vs Daily Traffic Volume Timeline */}
+        {normalizedBars.length > 0 && (
+          <div className="tl-card">
+            <div className="tl-head">
               <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-                <span style={{ fontWeight: 700, fontSize: 12, color: '#334155' }}>
-                  📈 {isDaily ? 'Daily Traffic Volume' : 'Inflow Volume Timeline (Hourly Traffic Pulse)'}
+                <span style={{ fontWeight: 800, fontSize: 13, color: '#0f172a', display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                  📈 {isDaily ? 'Daily Traffic Volume' : 'Inflow Volume Timeline'}
+                  <span style={{ fontSize: 10, fontWeight: 600, color: '#64748b' }}>
+                    ({isDaily ? 'Daily Trend' : 'Hourly Pulse'})
+                  </span>
                 </span>
                 {/* Granularity Switcher: Hourly vs Daily */}
-                <div style={{ display: 'inline-flex', background: '#e2e8f0', borderRadius: 6, padding: 2 }}>
+                <div style={{ display: 'inline-flex', background: '#e2e8f0', borderRadius: 7, padding: 2 }}>
                   <button
                     type="button"
-                    onClick={() => { setTimelineMode('hourly'); setTimelineOffset(0); }}
+                    onClick={() => setTimelineMode('hourly')}
                     style={{
-                      padding: '3px 8px', fontSize: 10, fontWeight: 700, border: 'none', borderRadius: 5,
+                      padding: '3px 9px', fontSize: 10, fontWeight: 700, border: 'none', borderRadius: 5,
                       background: !isDaily ? '#fff' : 'transparent',
                       color: !isDaily ? '#0f172a' : '#64748b', cursor: 'pointer',
                       boxShadow: !isDaily ? '0 1px 3px rgba(0,0,0,0.1)' : 'none'
@@ -1133,9 +1131,9 @@ function GateAnalyticsCard({ analytics, devices, timeFilter, setTimeFilter }) {
                   </button>
                   <button
                     type="button"
-                    onClick={() => { setTimelineMode('daily'); setTimelineOffset(0); }}
+                    onClick={() => setTimelineMode('daily')}
                     style={{
-                      padding: '3px 8px', fontSize: 10, fontWeight: 700, border: 'none', borderRadius: 5,
+                      padding: '3px 9px', fontSize: 10, fontWeight: 700, border: 'none', borderRadius: 5,
                       background: isDaily ? '#fff' : 'transparent',
                       color: isDaily ? '#0f172a' : '#64748b', cursor: 'pointer',
                       boxShadow: isDaily ? '0 1px 3px rgba(0,0,0,0.1)' : 'none'
@@ -1146,119 +1144,74 @@ function GateAnalyticsCard({ analytics, devices, timeFilter, setTimeFilter }) {
                 </div>
               </div>
 
-              {/* Left / Right Navigation Controls */}
+              {/* Metrics Summary Pills */}
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                <button
-                  type="button"
-                  onClick={() => setTimelineOffset(prev => Math.min(Math.max(0, totalItems - WINDOW_SIZE), prev + WINDOW_SIZE))}
-                  disabled={!canGoEarlier}
-                  style={{
-                    padding: '4px 10px',
-                    fontSize: 11,
-                    fontWeight: 700,
-                    borderRadius: 6,
-                    border: '1px solid #cbd5e1',
-                    background: canGoEarlier ? '#fff' : '#f1f5f9',
-                    color: canGoEarlier ? '#1e293b' : '#94a3b8',
-                    cursor: canGoEarlier ? 'pointer' : 'not-allowed',
-                    display: 'flex', alignItems: 'center', gap: 4,
-                    boxShadow: canGoEarlier ? '0 1px 2px rgba(0,0,0,0.05)' : 'none'
-                  }}
-                  title="View previous hours / earlier data"
-                >
-                  ◀ Earlier
-                </button>
-
-                <span style={{ fontSize: 11, color: '#475569', fontWeight: 700, minWidth: 90, textAlign: 'center' }}>
-                  {totalItems > 0 ? (
-                    `${startIndex + 1}–${endIndex} of ${totalItems} ${isDaily ? 'days' : 'hrs'}`
-                  ) : '0 data'}
+                <span className="tl-pill peak">
+                  🔥 Peak: <b>{maxPeak.toLocaleString()}</b> {isDaily ? '/day' : '/hr'}
                 </span>
-
-                <button
-                  type="button"
-                  onClick={() => setTimelineOffset(prev => Math.max(0, prev - WINDOW_SIZE))}
-                  disabled={!canGoLater}
-                  style={{
-                    padding: '4px 10px',
-                    fontSize: 11,
-                    fontWeight: 700,
-                    borderRadius: 6,
-                    border: '1px solid #cbd5e1',
-                    background: canGoLater ? '#fff' : '#f1f5f9',
-                    color: canGoLater ? '#1e293b' : '#94a3b8',
-                    cursor: canGoLater ? 'pointer' : 'not-allowed',
-                    display: 'flex', alignItems: 'center', gap: 4,
-                    boxShadow: canGoLater ? '0 1px 2px rgba(0,0,0,0.05)' : 'none'
-                  }}
-                  title="View later hours / more recent data"
-                >
-                  Later ▶
-                </button>
-
-                <span style={{ fontSize: 11, color: '#64748b', marginLeft: 6 }}>
-                  Peak: <b>{maxPeak}</b> vehicles {isDaily ? '/day' : '/hr'}
+                <span className="tl-pill">
+                  Avg: <b>{windowAvg.toLocaleString()}</b>
+                </span>
+                <span className={`tl-pill total ${isDaily ? 'daily' : ''}`}>
+                  Total: <b>{windowTotal.toLocaleString()}</b>
                 </span>
               </div>
             </div>
 
-            {/* Timeline Bars */}
-            <div style={{ display: 'flex', alignItems: 'flex-end', gap: 10, height: 75, paddingTop: 10, overflowX: 'auto' }}>
-              {isDaily ? (
-                visibleItems.map(d => {
-                  const heightPct = Math.max(12, Math.round((d.count / maxPeak) * 100));
-                  return (
-                    <div key={d.dayLabel} style={{ flex: 1, minWidth: 60, display: 'flex', flexDirection: 'column', alignItems: 'center', height: '100%' }}>
-                      <span style={{ fontSize: 10, fontWeight: 700, color: '#475569', marginBottom: 4 }}>
-                        {d.count}
-                      </span>
-                      <div style={{ flex: 1, width: '100%', display: 'flex', alignItems: 'flex-end', background: '#e2e8f0', borderRadius: '4px 4px 0 0' }}>
-                        <div
-                          style={{
-                            width: '100%',
-                            height: `${heightPct}%`,
-                            background: 'linear-gradient(180deg, #3b82f6 0%, #1d4ed8 100%)',
-                            borderRadius: '4px 4px 0 0',
-                            transition: 'height 0.4s ease'
-                          }}
-                          title={`${d.dayLabel}: ${d.count} vehicles`}
-                        />
-                      </div>
-                      <span style={{ fontSize: 9, color: '#64748b', marginTop: 4, whiteSpace: 'nowrap' }}>
-                        {d.dayLabel}
-                      </span>
+            {/* Chart Plot Canvas */}
+            <div className="tl-plot-wrap">
+              <div className="tl-yaxis">
+                <span>{maxPeak}</span>
+                <span>{Math.round(maxPeak / 2)}</span>
+                <span>0</span>
+              </div>
+
+              <div className="tl-canvas">
+                <div className="tl-canvas-inner" style={{ minWidth: normalizedBars.length > 8 ? `${normalizedBars.length * 64}px` : '100%' }}>
+                  <div className="tl-gridlines">
+                    <div className="tl-gridline" />
+                    <div className="tl-gridline" />
+                    <div className="tl-gridline base" />
+                  </div>
+
+                  {normalizedBars.length > 1 && windowAvg > 0 && (
+                    <div
+                      className="tl-avg-line"
+                      style={{
+                        top: `${24 + Math.round(Math.max(0, Math.min(1, 1 - windowAvg / maxPeak)) * 108)}px`
+                      }}
+                    >
+                      <span className="tl-avg-tag">avg {windowAvg}</span>
                     </div>
-                  );
-                })
-              ) : (
-                visibleItems.map(h => {
-                  const heightPct = Math.max(12, Math.round((h.count / maxPeak) * 100));
-                  const dateObj = new Date(h.bucket);
-                  const hourLabel = dateObj.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: 'numeric', hour12: true });
-                  return (
-                    <div key={h.bucket} style={{ flex: 1, minWidth: 60, display: 'flex', flexDirection: 'column', alignItems: 'center', height: '100%' }}>
-                      <span style={{ fontSize: 10, fontWeight: 700, color: '#475569', marginBottom: 4 }}>
-                        {h.count}
-                      </span>
-                      <div style={{ flex: 1, width: '100%', display: 'flex', alignItems: 'flex-end', background: '#e2e8f0', borderRadius: '4px 4px 0 0' }}>
-                        <div
-                          style={{
-                            width: '100%',
-                            height: `${heightPct}%`,
-                            background: 'linear-gradient(180deg, #10b981 0%, #059669 100%)',
-                            borderRadius: '4px 4px 0 0',
-                            transition: 'height 0.4s ease'
-                          }}
-                          title={`${hourLabel}: ${h.count} vehicles`}
-                        />
-                      </div>
-                      <span style={{ fontSize: 9, color: '#64748b', marginTop: 4, whiteSpace: 'nowrap' }}>
-                        {hourLabel}
-                      </span>
-                    </div>
-                  );
-                })
-              )}
+                  )}
+
+                  <div className="tl-bars">
+                    {normalizedBars.map(bar => {
+                      const barPx = bar.count > 0 ? Math.max(6, Math.round((bar.count / maxPeak) * 108)) : 3;
+                      const sharePct = windowTotal > 0 ? Math.round((bar.count / windowTotal) * 100) : 0;
+                      const isPeak = bar.count === maxPeak && maxPeak > 0;
+                      const modeClass = isDaily ? 'daily' : 'hourly';
+                      return (
+                        <div key={bar.key} className="tl-col" title={`${bar.label}: ${bar.count.toLocaleString()} vehicles (${sharePct}% of window)`}>
+                          <div className="tl-track">
+                            <span className={`tl-val ${isPeak ? 'peak' : ''}`}>
+                              {isPeak ? '★ ' : ''}{bar.count.toLocaleString()}
+                            </span>
+                            <div
+                              className={`tl-bar ${modeClass} ${isPeak ? 'peak' : ''}`}
+                              style={{ height: `${barPx}px` }}
+                            />
+                          </div>
+                          <div className="tl-xlab">
+                            <b>{bar.label}</b>
+                            <small>{sharePct}%</small>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         )}

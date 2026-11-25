@@ -977,21 +977,160 @@ table.tbl {
 }
 
 /* ── Security Gate Vehicle Count Matrix ── */
-.vc-matrix{width:100%;border-collapse:collapse;font-size:11px;margin-top:8px}
-.vc-matrix th{text-align:left;font-size:9px;text-transform:uppercase;letter-spacing:.4px;font-weight:800;color:#8ca0bc;padding:6px 8px;border-bottom:1px solid #eef2f7}
-.vc-matrix th.num,.vc-matrix td.num{text-align:right;font-variant-numeric:tabular-nums}
-.vc-matrix td{padding:8px 8px;border-bottom:1px solid #f3f6fa;color:#1e293b;font-weight:600}
-.vc-matrix tr:last-child td{border-bottom:0}
-.vc-pill{display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:6px;font-size:10px;font-weight:800}
-.vc-pill.in{background:#dcfce7;color:#15803d}
-.vc-pill.out{background:#dbeafe;color:#1d4ed8}
-.vc-pill.net-pos{background:#fef9c3;color:#854d0e}
-.vc-pill.net-zero{background:#f1f5f9;color:#475569}
-.vc-live-row{padding:10px 12px;border:1px solid #e7ecf4;border-radius:10px;background:#fbfcfe;display:grid;gap:7px}
-.vc-live-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px}
-.vc-mini-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
-.vc-mini-chip{background:#fff;border:1px solid #e7ecf4;border-radius:7px;padding:5px 6px;text-align:center}
-.vc-mini-chip span{display:block;font-size:9px;color:#7c8fa8;font-weight:700}
-.vc-mini-chip b{display:block;font-size:13px;color:#172138;font-weight:800;margin-top:1px}
-.vc-range-btn{padding:3px 8px;font-size:10px;font-weight:700;border-radius:6px;border:1px solid #dce4ef;background:#fff;color:#475569}
-.vc-range-btn.active{background:var(--primary-500);border-color:var(--primary-500);color:#fff}
+.vc-matrix {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  margin-top: 8px
+}
+
+.vc-matrix th {
+  text-align: left;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: .4px;
+  font-weight: 800;
+  color: #8ca0bc;
+  padding: 6px 8px;
+  border-bottom: 1px solid #eef2f7
+}
+
+.vc-matrix th.num,
+.vc-matrix td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums
+}
+
+.vc-matrix td {
+  padding: 8px 8px;
+  border-bottom: 1px solid #f3f6fa;
+  color: #1e293b;
+  font-weight: 600
+}
+
+.vc-matrix tr:last-child td {
+  border-bottom: 0
+}
+
+.vc-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 6px;
+  font-size: 10px;
+  font-weight: 800
+}
+
+.vc-pill.in {
+  background: #dcfce7;
+  color: #15803d
+}
+
+.vc-pill.out {
+  background: #dbeafe;
+  color: #1d4ed8
+}
+
+.vc-pill.net-pos {
+  background: #fef9c3;
+  color: #854d0e
+}
+
+.vc-pill.net-zero {
+  background: #f1f5f9;
+  color: #475569
+}
+
+.vc-live-row {
+  padding: 10px 12px;
+  border: 1px solid #e7ecf4;
+  border-radius: 10px;
+  background: #fbfcfe;
+  display: grid;
+  gap: 7px
+}
+
+.vc-live-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 10px
+}
+
+.vc-mini-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px
+}
+
+.vc-mini-chip {
+  background: #fff;
+  border: 1px solid #e7ecf4;
+  border-radius: 7px;
+  padding: 5px 6px;
+  text-align: center
+}
+
+.vc-mini-chip span {
+  display: block;
+  font-size: 9px;
+  color: #7c8fa8;
+  font-weight: 700
+}
+
+.vc-mini-chip b {
+  display: block;
+  font-size: 13px;
+  color: #172138;
+  font-weight: 800;
+  margin-top: 1px
+}
+
+.vc-range-btn {
+  padding: 3px 8px;
+  font-size: 10px;
+  font-weight: 700;
+  border-radius: 6px;
+  border: 1px solid #dce4ef;
+  background: #fff;
+  color: #475569
+}
+
+.vc-range-btn.active {
+  background: var(--primary-500);
+  border-color: var(--primary-500);
+  color: #fff
+}
+
+/* ── Modern Traffic Pulse Timeline Chart ── */
+.tl-card{margin-top:16px;background:linear-gradient(180deg,#ffffff 0%,#f8fafd 100%);border:1px solid #e2e8f0;border-radius:12px;padding:14px 16px;box-shadow:0 2px 8px -4px rgba(15,23,42,.08)}
+.tl-head{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+.tl-pill{display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:999px;font-size:10px;font-weight:700;border:1px solid #e2e8f0;background:#fff;color:#475569;font-variant-numeric:tabular-nums}
+.tl-pill.peak{background:#fffbeb;border-color:#fde68a;color:#b45309}
+.tl-pill.total{background:#ecfdf5;border-color:#a7f3d0;color:#047857}
+.tl-pill.total.daily{background:#eff6ff;border-color:#bfdbfe;color:#1d4ed8}
+.tl-plot-wrap{position:relative;display:flex;align-items:stretch;gap:8px;padding:10px 10px 6px;background:#fff;border:1px solid #eef2f7;border-radius:10px}
+.tl-yaxis{display:flex;flex-direction:column;justify-content:space-between;height:132px;padding-top:18px;font-size:9px;font-weight:700;color:#94a3b8;text-align:right;min-width:26px;font-variant-numeric:tabular-nums;user-select:none}
+.tl-canvas{position:relative;flex:1;min-width:0;height:166px;overflow-x:auto;overflow-y:hidden}
+.tl-canvas-inner{position:relative;height:166px;display:flex;flex-direction:column}
+.tl-gridlines{position:absolute;left:0;right:0;top:24px;height:108px;pointer-events:none;display:flex;flex-direction:column;justify-content:space-between}
+.tl-gridline{border-top:1px dashed #e2e8f0;width:100%;height:0}
+.tl-gridline.base{border-top:1px solid #cbd5e1}
+.tl-avg-line{position:absolute;left:0;right:0;border-top:1.5px dashed rgba(100,116,139,.45);pointer-events:none;z-index:1}
+.tl-avg-tag{position:absolute;right:4px;top:-14px;font-size:8px;font-weight:800;color:#64748b;background:rgba(255,255,255,.92);padding:1px 5px;border-radius:4px;border:1px solid #e2e8f0}
+.tl-bars{position:relative;z-index:2;height:166px;display:flex;align-items:stretch;justify-content:space-evenly;gap:12px}
+.tl-col{flex:1;min-width:52px;max-width:110px;display:flex;flex-direction:column;align-items:center;border-radius:8px;padding:0 4px;transition:background .18s ease}
+.tl-col:hover{background:rgba(241,245,249,.65)}
+.tl-track{height:132px;width:100%;display:flex;flex-direction:column;justify-content:flex-end;align-items:center}
+.tl-val{font-size:10px;font-weight:800;color:#334155;padding:1px 6px;border-radius:999px;margin-bottom:4px;background:#f8fafc;border:1px solid #e2e8f0;font-variant-numeric:tabular-nums;line-height:1.25;transition:transform .18s ease}
+.tl-val.peak{background:#fef3c7;border-color:#fcd34d;color:#92400e;box-shadow:0 2px 6px -2px rgba(217,119,6,.35)}
+.tl-col:hover .tl-val{transform:translateY(-2px)}
+.tl-bar{width:100%;max-width:42px;border-radius:8px 8px 3px 3px;transition:height .4s cubic-bezier(.22,1,.36,1),transform .18s ease,filter .18s ease;box-shadow:inset 0 1px 0 rgba(255,255,255,.45),0 6px 14px -6px rgba(5,150,105,.45)}
+.tl-bar.hourly{background:linear-gradient(180deg,#34d399 0%,#059669 100%)}
+.tl-bar.hourly.peak{background:linear-gradient(180deg,#10b981 0%,#047857 100%);box-shadow:inset 0 2px 0 rgba(254,240,138,.7),0 8px 18px -5px rgba(5,150,105,.55)}
+.tl-bar.daily{background:linear-gradient(180deg,#60a5fa 0%,#2563eb 100%);box-shadow:inset 0 1px 0 rgba(255,255,255,.45),0 6px 14px -6px rgba(37,99,235,.45)}
+.tl-bar.daily.peak{background:linear-gradient(180deg,#3b82f6 0%,#1d4ed8 100%);box-shadow:inset 0 2px 0 rgba(191,219,254,.75),0 8px 18px -5px rgba(29,78,216,.55)}
+.tl-col:hover .tl-bar{filter:brightness(1.06);transform:scaleX(1.05)}
+.tl-xlab{height:34px;display:flex;flex-direction:column;align-items:center;justify-content:center;padding-top:4px}
+.tl-xlab b{font-size:10px;font-weight:700;color:#334155;white-space:nowrap}
+.tl-xlab small{font-size:8px;font-weight:700;color:#94a3b8}
