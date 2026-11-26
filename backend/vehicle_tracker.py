@@ -11,6 +11,7 @@ Auth: X-Local-Vision-Key header, same shared key as the other vision services.
 import base64
 import collections
 import hmac
+import html
 import json
 import os
 import pathlib
@@ -19,6 +20,7 @@ import socket
 import sqlite3
 import threading
 import time
+import urllib.error
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -125,6 +127,12 @@ if os.path.exists(MODE_STATE_FILE):
 DB_PATH = DEMO_DB_PATH if CURRENT_FEED_MODE == 'demo' else LIVE_DB_PATH
 RTSP_BASE = os.environ.get('RTSP_BASE', 'rtsp://124.123.89.162:31554/live')
 OBJECTS_URLS = [u.strip() for u in os.environ.get('OBJECTS_URLS', 'http://172.17.0.1:31012,http://172.17.0.1:31013').split(',') if u.strip()]
+EMAIL_DISPATCH_URLS = [
+    u.strip() for u in os.environ.get(
+        'EMAIL_DISPATCH_URL',
+        'http://172.17.0.1:31040/api/email/dispatch,http://127.0.0.1:31040/api/email/dispatch,http://124.123.89.162:31040/api/email/dispatch'
+    ).split(',') if u.strip()
+]
 
 # IST Timezone helper (+05:30)
 IST_OFFSET_SEC = int(5.5 * 3600)
@@ -454,15 +462,33 @@ class VehicleDetector:
 
         print(f"[VehicleDetector] Successfully loaded: {model_path.name} (Engine: {'ONNXRuntime' if self.use_ort else 'OpenCV-DNN'})")
 
-    def detect(self, frame, conf_thresh=0.25):
+    @staticmethod
+    def _letterbox(frame, new_shape=(640, 640), color=(114, 114, 114)):
+        """Resize keeping aspect ratio and pad to square (matches Ultralytics YOLO training preprocessing)."""
         h, w = frame.shape[:2]
+        r = min(new_shape[0] / max(1, h), new_shape[1] / max(1, w))
+        new_unpad = (max(1, int(round(w * r))), max(1, int(round(h * r))))
+        dw = (new_shape[1] - new_unpad[0]) / 2.0
+        dh = (new_shape[0] - new_unpad[1]) / 2.0
+        img = cv2.resize(frame, new_unpad, interpolation=cv2.INTER_LINEAR) if (w, h) != new_unpad else frame
+        top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+        left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+        if top > 0 or bottom > 0 or left > 0 or right > 0:
+            img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+        return img, r, dw, dh
+
+    def detect(self, frame, conf_thresh=0.25):
+        if frame is None or frame.size == 0:
+            return []
+        h, w = frame.shape[:2]
+        lb_img, r, dw, dh = self._letterbox(frame, (640, 640))
         if self.use_ort:
-            img = cv2.resize(frame, (640, 640)).astype(np.float32) / 255.0
-            img = np.transpose(img, (2, 0, 1))[None, ...]
-            preds = self.sess.run([self.output_name], {self.input_name: img})[0]
+            rgb = cv2.cvtColor(lb_img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            inp = np.transpose(rgb, (2, 0, 1))[None, ...]
+            preds = self.sess.run([self.output_name], {self.input_name: inp})[0]
             out = preds[0].T
         else:
-            blob = cv2.dnn.blobFromImage(frame, 1/255.0, (640, 640), swapRB=True, crop=False)
+            blob = cv2.dnn.blobFromImage(lb_img, 1/255.0, (640, 640), swapRB=True, crop=False)
             self.net.setInput(blob)
             preds = self.net.forward()
             out = preds[0].T
@@ -485,7 +511,6 @@ class VehicleDetector:
 
         v_boxes = boxes[mask]
         filtered_scores = scores[mask]
-        scale_x, scale_y = w / 640.0, h / 640.0
 
         candidate_boxes = []
         scores_list = []
@@ -496,7 +521,7 @@ class VehicleDetector:
             sub_idx = int(np.argmax(s_row[v_cls]))
             chosen_cid = v_cls[sub_idx]
             chosen_score = float(s_row[chosen_cid])
-            # Only tie-break in favor of specialized classes when closely competing with 'car'
+            # Preserve direct 'car' winner without biased overrides; require clear margins for specialized classes
             v_probs = None
             if check_special and chosen_cid != 1:
                 car_s = float(s_row[0])
@@ -504,21 +529,29 @@ class VehicleDetector:
                 auto_s = float(s_row[2])
                 bike_s = float(s_row[3])
                 v_probs = {'car': car_s, 'auto': auto_s, 'bike': bike_s, 'ambulance': amb_s}
-                if chosen_cid == 0:
-                    for spec_cid, spec_s in ((4, amb_s), (2, auto_s), (3, bike_s)):
-                        if spec_s >= 0.28 and spec_s >= car_s * 0.90:
-                            chosen_cid, chosen_score = spec_cid, spec_s
-                            break
+                amb_strong = (amb_s >= 0.65 and amb_s >= car_s * 1.45 and amb_s >= auto_s * 1.45)
+                if chosen_cid == 4 and not amb_strong:
+                    chosen_cid = 0
+                    chosen_score = max(car_s, amb_s * 0.80)
+                    v_probs['car'] = max(car_s, chosen_score)
+                elif chosen_cid in (2, 3) and ((chosen_score < 0.35 and car_s >= 0.15) or (car_s >= 0.20 and chosen_score < car_s * 1.25)):
+                    spec_key = 'auto' if chosen_cid == 2 else 'bike'
+                    chosen_cid = 0
+                    chosen_score = max(car_s, chosen_score * 0.85)
+                    v_probs['car'] = max(car_s, chosen_score)
+                    v_probs[spec_key] = min(v_probs[spec_key], max(0.0, float(v_probs['car']) * 0.70))
+                if not amb_strong:
+                    v_probs['ambulance'] = min(amb_s, max(0.0, float(v_probs['car']) * 0.50))
             elif chosen_cid != 1:
                 v_name = normalize_vehicle_type(self.cls_names.get(chosen_cid, 'car'))
                 v_probs = {v_name: chosen_score}
 
             cx, cy, bw, bh = b
-            x1 = max(0, int((cx - bw / 2) * scale_x))
-            y1 = max(0, int((cy - bh / 2) * scale_y))
-            x2 = min(w, int((cx + bw / 2) * scale_x))
-            y2 = min(h, int((cy + bh / 2) * scale_y))
-            candidate_boxes.append([x1, y1, x2 - x1, y2 - y1])
+            x1 = max(0, int(((cx - bw / 2.0) - dw) / r))
+            y1 = max(0, int(((cy - bh / 2.0) - dh) / r))
+            x2 = min(w, int(((cx + bw / 2.0) - dw) / r))
+            y2 = min(h, int(((cy + bh / 2.0) - dh) / r))
+            candidate_boxes.append([x1, y1, max(1, x2 - x1), max(1, y2 - y1)])
             scores_list.append(chosen_score)
             v_cls_chosen.append(chosen_cid)
             cls_scores_list.append(v_probs)
@@ -529,15 +562,53 @@ class VehicleDetector:
             idx = i[0] if isinstance(i, (list, tuple, np.ndarray)) else i
             bx, by, bw, bh = candidate_boxes[idx]
             cid = v_cls_chosen[idx]
+            score_val = scores_list[idx]
+            cls_scores_val = cls_scores_list[idx]
+            if cid == 4 and frame is not None and bw > 10 and bh > 10:
+                rx1 = max(0, bx + int(bw * 0.15))
+                rx2 = min(w, bx + int(bw * 0.85))
+                ry1 = max(0, by + int(bh * 0.12))
+                ry2 = min(h, by + int(bh * 0.70))
+                body = frame[ry1:ry2, rx1:rx2]
+                if body.size > 0:
+                    v_chan = cv2.cvtColor(body, cv2.COLOR_BGR2HSV)[:, :, 2]
+                    if float(np.percentile(v_chan, 75)) < 130.0:
+                        cid = 0
+                        if cls_scores_val is not None:
+                            cls_scores_val = dict(cls_scores_val)
+                            cls_scores_val['car'] = max(float(cls_scores_val.get('car', 0.0)), float(score_val))
+                            cls_scores_val['ambulance'] = 0.0
             item = {
                 "bbox": [bx, by, bx + bw, by + bh],
-                "score": round(scores_list[idx], 3),
+                "score": round(score_val, 3),
                 "cls": cid,
                 "name": self.cls_names.get(cid, 'vehicle')
             }
-            if cls_scores_list[idx] is not None:
-                item["cls_scores"] = cls_scores_list[idx]
+            if cls_scores_val is not None:
+                item["cls_scores"] = cls_scores_val
             results.append(item)
+
+        # Suppress weak partial bumper/sub-box false positives wholly contained inside a high-confidence car
+        if len(results) > 1:
+            strong_cars = [it for it in results if it['cls'] == 0 and it['score'] >= 0.70]
+            if strong_cars:
+                kept = []
+                for it in results:
+                    if it['cls'] in (2, 3, 4) and it['score'] < 0.55:
+                        sx1, sy1, sx2, sy2 = it['bbox']
+                        s_area = max(1, (sx2 - sx1) * (sy2 - sy1))
+                        contained = False
+                        for c in strong_cars:
+                            cx1, cy1, cx2, cy2 = c['bbox']
+                            ix1, iy1 = max(sx1, cx1), max(sy1, cy1)
+                            ix2, iy2 = min(sx2, cx2), min(sy2, cy2)
+                            if ix2 > ix1 and iy2 > iy1 and ((ix2 - ix1) * (iy2 - iy1) / float(s_area)) >= 0.80:
+                                contained = True
+                                break
+                        if contained:
+                            continue
+                    kept.append(it)
+                results = kept
         return results
 def _order_quad(pts):
     """Order any 4 polygon corners clockwise as [top-left, top-right, bottom-right, bottom-left]."""
@@ -695,14 +766,25 @@ class Detector:
 
     @staticmethod
     def _match_vehicle(cx, cy, vehicles):
-        """Return (index, vehicle_dict) for the smallest vehicle bbox enclosing (cx, cy)."""
-        best_idx, best_v, best_area = None, None, float('inf')
-        for idx, v in enumerate(vehicles):
-            vx1, vy1, vx2, vy2 = v['bbox']
-            if (vx1 - 25) <= cx <= (vx2 + 25) and (vy1 - 25) <= cy <= (vy2 + 25):
-                area = (vx2 - vx1) * (vy2 - vy1)
-                if area < best_area:
-                    best_idx, best_v, best_area = idx, v, area
+        """Return (index, vehicle_dict) whose bumper/interior best aligns with plate center (cx, cy)."""
+        best_idx, best_v, best_rank = None, None, -1e9
+        for margin in (0, 6):
+            for idx, v in enumerate(vehicles):
+                vx1, vy1, vx2, vy2 = v['bbox']
+                if (vx1 - margin) <= cx <= (vx2 + margin) and (vy1 - margin) <= cy <= (vy2 + margin):
+                    vw = max(1.0, vx2 - vx1)
+                    vh = max(1.0, vy2 - vy1)
+                    area = vw * vh
+                    rel_x = abs(cx - (vx1 + vx2) / 2.0) / (vw * 0.5)
+                    rel_y = (cy - vy1) / vh
+                    bumper_score = (1.0 - min(1.5, rel_x)) * 1.2 + (0.6 if 0.35 <= rel_y <= 0.98 else 0.0)
+                    conf_score = float(v.get('score', 0.5)) * 0.6
+                    area_tie = -min(1.0, area / 500000.0) * 0.15
+                    rank = bumper_score + conf_score + area_tie - margin * 0.05
+                    if rank > best_rank:
+                        best_idx, best_v, best_rank = idx, v, rank
+            if best_v is not None:
+                break
         return best_idx, best_v
 
     def _try_record_plate(self, frame, quad, det_score, fallback_vehicle, vehicles, seen_quads, detections):
@@ -723,7 +805,11 @@ class Detector:
             return False, None
 
         m_idx, matched_v = self._match_vehicle(cx, cy, vehicles)
-        v_used = matched_v or fallback_vehicle
+        v_used = matched_v
+        if v_used is None and fallback_vehicle is not None:
+            fx1, fy1, fx2, fy2 = fallback_vehicle['bbox']
+            if (fx1 - 8) <= cx <= (fx2 + 8) and (fy1 - 8) <= cy <= (fy2 + 8):
+                v_used = fallback_vehicle
         x_b, y_b, w_b, h_b = cv2.boundingRect(ordered.astype(np.int32))
         area_factor = min(1.0, (w_b * h_b) / 3000.0)
         quality = float((ocr_conf ** 2) * (0.35 + 0.65 * area_factor) * (0.6 + 0.4 * min(1.0, float(det_score))))
@@ -736,7 +822,8 @@ class Detector:
             'ocr_conf': round(float(ocr_conf), 3),
             'quality': round(quality, 4),
             'vehicle_bbox': v_used['bbox'] if v_used else [x_b, y_b, x_b + w_b, y_b + h_b],
-            'vehicle_name': v_used['name'] if v_used else 'vehicle'
+            'vehicle_name': v_used['name'] if v_used else 'vehicle',
+            'matched_v': (v_used is not None)
         })
         return True, m_idx
 
@@ -900,6 +987,9 @@ class Store:
                 CREATE INDEX IF NOT EXISTS vc_dir_ts ON vehicle_counts(direction, ts);
                 CREATE INDEX IF NOT EXISTS vc_stream_ts ON vehicle_counts(stream, ts);
                 CREATE INDEX IF NOT EXISTS vc_plate_dir ON vehicle_counts(plate, direction, ts);
+                CREATE TABLE IF NOT EXISTS ambulance_dispatches(id TEXT PRIMARY KEY, ref_id TEXT, plate TEXT, recipients TEXT NOT NULL, subject TEXT NOT NULL, note TEXT DEFAULT '', message_id TEXT DEFAULT '', ts INTEGER NOT NULL);
+                CREATE INDEX IF NOT EXISTS amb_disp_ts ON ambulance_dispatches(ts);
+                CREATE INDEX IF NOT EXISTS amb_disp_ref ON ambulance_dispatches(ref_id, ts);
                 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             ''')
             for tbl, col, col_def in [
@@ -1109,7 +1199,11 @@ class Store:
         if trust_candidate:
             return c
         if {e, c} == {'car', 'ambulance'}:
-            return 'ambulance' if (e == 'ambulance' and existing_conf >= 0.40) or candidate_conf >= 0.45 else 'car'
+            ec = float(existing_conf or 0.0)
+            cc = float(candidate_conf or 0.0)
+            if c == 'ambulance':
+                return 'ambulance' if (cc >= 0.70 and cc > ec) else 'car'
+            return 'car' if (cc >= ec or ec < 0.70) else 'ambulance'
         if float(candidate_conf or 0.0) > float(existing_conf or 0.0) + 0.08:
             return c
         if e == 'car' and float(existing_conf or 0.0) <= 0.0 and c != 'car':
@@ -1299,11 +1393,24 @@ class Store:
     @staticmethod
     def _empty_vtype_bucket():
         return {'car': 0, 'bike': 0, 'auto': 0, 'ambulance': 0, 'total': 0}
-    def vehicle_counts_summary(self, from_ts=0, to_ts=None, granularity='hourly', event_limit=50):
+    def vehicle_counts_summary(self, from_ts=0, to_ts=None, granularity='hourly', event_limit=50, direction=None, vehicle_type=None):
         """Query persisted historical incoming/outgoing vehicle counts from vehicle_counts table."""
         end_ts = int(to_ts) if to_ts is not None else int(time.time() * 1000)
         start_ts = max(0, int(from_ts or 0))
         devices = {d['stream']: d for d in self.devices()}
+        ev_sql = (
+            "SELECT id, stream, direction, vehicle_type, plate, confidence, ts, COALESCE(gate_group,''), COALESCE(merged_streams,'') "
+            "FROM vehicle_counts WHERE ts>=? AND ts<=?"
+        )
+        ev_params = [start_ts, end_ts]
+        if direction in ('incoming', 'outgoing'):
+            ev_sql += ' AND direction=?'
+            ev_params.append(direction)
+        if vehicle_type in VEHICLE_TYPES:
+            ev_sql += ' AND vehicle_type=?'
+            ev_params.append(vehicle_type)
+        ev_sql += ' ORDER BY ts DESC LIMIT ?'
+        ev_params.append(max(1, int(event_limit)))
 
         with self.lock:
             agg_rows = self.db.execute(
@@ -1318,11 +1425,7 @@ class Store:
                 'SELECT direction, vehicle_type, ts FROM vehicle_counts WHERE ts>=? AND ts<=? ORDER BY ts',
                 (start_ts, end_ts)
             ).fetchall()
-            event_rows = self.db.execute(
-                "SELECT id, stream, direction, vehicle_type, plate, confidence, ts, COALESCE(gate_group,''), COALESCE(merged_streams,'') "
-                "FROM vehicle_counts WHERE ts>=? AND ts<=? ORDER BY ts DESC LIMIT ?",
-                (start_ts, end_ts, max(1, int(event_limit)))
-            ).fetchall()
+            event_rows = self.db.execute(ev_sql, ev_params).fetchall()
             all_rows = self.db.execute(
                 'SELECT direction, vehicle_type, COUNT(*) FROM vehicle_counts GROUP BY direction, vehicle_type'
             ).fetchall()
@@ -1361,7 +1464,10 @@ class Store:
             cam_map[key][vt] += int(cnt)
             cam_map[key]['total'] += int(cnt)
 
-        is_daily = (granularity == 'daily') or (start_ts > 0 and (end_ts - start_ts) > 48 * 3600000) or (start_ts == 0)
+        if granularity in ('hourly', 'daily'):
+            is_daily = (granularity == 'daily')
+        else:
+            is_daily = (start_ts > 0 and (end_ts - start_ts) > 48 * 3600000) or (start_ts == 0)
         bucket_ms = 86400000 if is_daily else 3600000
         hist_buckets = {}
         for direction, vtype, ts_val in raw_hist:
@@ -1450,12 +1556,19 @@ def _pick_journey_plate(reads):
 
 def _pick_journey_vtype(reads):
     weights = collections.defaultdict(float)
+    counts = collections.Counter()
     for r in reads:
         vt = normalize_vehicle_type(r.get('vehicle_type'))
         weights[vt] += max(0.30, float(r.get('confidence') or 0.70))
+        counts[vt] += 1
     total = sum(weights.values()) or 1.0
-    if weights.get('ambulance', 0.0) / total >= 0.35:
+    amb_share = weights.get('ambulance', 0.0) / total
+    req_amb = 2 if len(reads) >= 2 else 1
+    if counts.get('ambulance', 0) >= req_amb and amb_share > 0.55:
         return 'ambulance'
+    non_amb = [(vt, w) for vt, w in weights.items() if vt != 'ambulance']
+    if non_amb:
+        return max(non_amb, key=lambda x: x[1])[0]
     return max(weights.items(), key=lambda x: x[1])[0]
 
 def journeys(store, since_ms, plate_filter=None):
@@ -1552,11 +1665,253 @@ def journeys(store, since_ms, plate_filter=None):
         j_vtype = _pick_journey_vtype(reads_v)
         out.append({'plate': plate, 'vehicle_type': j_vtype, 'status': status, 'exit_confirmed': exit_confirmed,
                     'entry': {'id': first.get('id'), 'stream': first['stream'], 'device': devices.get(first['stream'], {}).get('name', first['stream']), 'at': first['ts'], 'photo_url': first['photo_url'], 'plate_url': first['plate_url'], 'confidence': first['confidence']},
-                    'exit': {'id': last.get('id'), 'stream': last['stream'], 'device': devices.get(last['stream'], {}).get('name', last['stream']), 'at': exited_at, 'photo_url': last['photo_url'], 'confidence': last['confidence']} if exited_at else None,
+                    'exit': {'id': last.get('id'), 'stream': last['stream'], 'device': devices.get(last['stream'], {}).get('name', last['stream']), 'at': exited_at, 'photo_url': last['photo_url'], 'plate_url': last['plate_url'], 'confidence': last['confidence']} if exited_at else None,
                     'cameras': cameras, 'camera_count': len(cameras), 'reads': len(reads_v),
                     'first_at': first['ts'], 'last_at': last['ts'], 'dwell_ms': max(0, end - first['ts'])})
     out.sort(key=lambda v: v['first_at'], reverse=True)
     return out
+
+def record_ambulance_dispatch(store, ref_id, plate, recipients, subject, note='', message_id='', ts=None):
+    did = uuid.uuid4().hex
+    ts_val = int(ts if ts is not None else time.time() * 1000)
+    clean_plate = plate.upper() if plate else ''
+    recips_str = ', '.join(recipients) if isinstance(recipients, (list, tuple)) else str(recipients or '')
+    with store.lock:
+        store.db.execute(
+            'INSERT INTO ambulance_dispatches(id, ref_id, plate, recipients, subject, note, message_id, ts) VALUES(?,?,?,?,?,?,?,?)',
+            (did, ref_id or '', clean_plate, recips_str, subject, note or '', message_id or '', ts_val)
+        )
+        store.db.commit()
+    return {'id': did, 'ref_id': ref_id or '', 'plate': clean_plate, 'recipients': recips_str, 'subject': subject, 'note': note or '', 'message_id': message_id or '', 'ts': ts_val}
+
+def list_ambulance_dispatches(store, since_ms=0, limit=500):
+    with store.lock:
+        rows = store.db.execute(
+            'SELECT id, ref_id, plate, recipients, subject, note, message_id, ts FROM ambulance_dispatches WHERE ts>=? ORDER BY ts DESC LIMIT ?',
+            (max(0, int(since_ms or 0)), max(1, int(limit)))
+        ).fetchall()
+    return [
+        {'id': r[0], 'ref_id': r[1], 'plate': r[2], 'recipients': r[3], 'subject': r[4], 'note': r[5], 'message_id': r[6], 'ts': r[7]}
+        for r in rows
+    ]
+
+def build_ambulance_list(store, hours=24, limit=200):
+    """Build unified Ambulance Registry combining plated ambulance journeys and unplated gate counts."""
+    now_ms = int(time.time() * 1000)
+    since_ms = int(now_ms - hours * 3600000)
+    amb_journeys = [v for v in journeys(store, since_ms) if v.get('vehicle_type') == 'ambulance']
+    vc_events = store.vehicle_counts_events(from_ts=since_ms, to_ts=now_ms, vehicle_type='ambulance', limit=1000)
+    dispatches = list_ambulance_dispatches(store, since_ms=since_ms, limit=500)
+
+    by_ref = {}
+    by_plate_disp = {}
+    for d in dispatches:
+        if d.get('ref_id') and d['ref_id'] not in by_ref:
+            by_ref[d['ref_id']] = d
+        if d.get('plate') and d['plate'] not in by_plate_disp:
+            by_plate_disp[d['plate']] = d
+
+    items = []
+    for v in amb_journeys:
+        entry = v.get('entry') or {}
+        exit_info = v.get('exit')
+        item_id = entry.get('id') or f"j_{v['plate']}_{v['first_at']}"
+        last_disp = by_ref.get(item_id) or by_plate_disp.get(v['plate'])
+        items.append({
+            'id': item_id,
+            'source': 'journey',
+            'plate': v['plate'],
+            'status': v['status'],
+            'exit_confirmed': bool(v.get('exit_confirmed')),
+            'direction': 'exited' if v['status'] == 'exited' else 'on_site',
+            'entry': entry,
+            'exit': exit_info,
+            'dwell_ms': v.get('dwell_ms', 0),
+            'first_at': v['first_at'],
+            'last_at': v['last_at'],
+            'cameras': v.get('cameras', []),
+            'reads': v.get('reads', 1),
+            'confidence': max([c.get('confidence') or 0 for c in v.get('cameras', [])] or [entry.get('confidence') or 0]),
+            'photo_url': (exit_info or {}).get('photo_url') or entry.get('photo_url'),
+            'plate_url': entry.get('plate_url') or (exit_info or {}).get('plate_url'),
+            'entry_sighting_id': entry.get('id'),
+            'exit_sighting_id': (exit_info or {}).get('id'),
+            'last_dispatch': last_disp,
+        })
+
+    # Include unplated (or standalone gate-count) ambulances not covered by a plated journey
+    for ev in vc_events:
+        ev_plate = ev.get('plate')
+        ev_ts = int(ev['ts'])
+        covered = False
+        if ev_plate:
+            for it in items:
+                if it['source'] == 'journey' and are_plates_similar_vc(it['plate'], ev_plate, allow_single_edit=True):
+                    if (it['first_at'] - 120000) <= ev_ts <= (it['last_at'] + 120000):
+                        covered = True
+                        break
+        if covered:
+            continue
+        is_in = (ev.get('direction') == 'incoming')
+        cam_node = {
+            'stream': ev['stream'],
+            'name': ev.get('camera') or ev['stream'],
+            'role': 'entry' if is_in else 'exit',
+            'first': ev_ts,
+            'last': ev_ts,
+            'reads': 1,
+            'confidence': ev.get('confidence')
+        }
+        items.append({
+            'id': ev['id'],
+            'source': 'gate_count',
+            'plate': ev_plate,
+            'status': 'on_site' if is_in else 'exited',
+            'exit_confirmed': not is_in,
+            'direction': ev.get('direction'),
+            'entry': {'stream': ev['stream'], 'device': ev.get('camera'), 'at': ev_ts, 'confidence': ev.get('confidence')} if is_in else None,
+            'exit': {'stream': ev['stream'], 'device': ev.get('camera'), 'at': ev_ts, 'confidence': ev.get('confidence')} if not is_in else None,
+            'dwell_ms': 0,
+            'first_at': ev_ts,
+            'last_at': ev_ts,
+            'cameras': [cam_node],
+            'merged_cameras': ev.get('merged_cameras') or [ev.get('camera') or ev['stream']],
+            'reads': 1,
+            'confidence': ev.get('confidence') or 0,
+            'photo_url': None,
+            'plate_url': None,
+            'entry_sighting_id': None,
+            'exit_sighting_id': None,
+            'last_dispatch': by_ref.get(ev['id']) or (by_plate_disp.get(ev_plate) if ev_plate else None),
+        })
+
+    items.sort(key=lambda x: x.get('last_at') or x.get('first_at') or 0, reverse=True)
+    trimmed = items[:max(1, int(limit))]
+    return {
+        'ambulances': trimmed,
+        'summary': {
+            'total': len(items),
+            'on_site': sum(1 for x in items if x['status'] == 'on_site'),
+            'exited': sum(1 for x in items if x['status'] == 'exited'),
+            'plated': sum(1 for x in items if x.get('plate')),
+            'unplated': sum(1 for x in items if not x.get('plate')),
+            'dispatched': sum(1 for x in items if x.get('last_dispatch')),
+        }
+    }
+
+def build_ambulance_email_html(subject, title=None, summary=None, metadata=None, status_tag='on_site', has_plate_crop=False, has_vehicle_photo=False):
+    """Build custom Medanta Ambulance Alert HTML compatible with 31040 inline CID attachments."""
+    is_active = (str(status_tag or '').lower() in ('on_site', 'incoming', 'arrival'))
+    badge_bg = '#fee2e2' if is_active else '#e0f2fe'
+    badge_color = '#b91c1c' if is_active else '#0369a1'
+    badge_border = '#fca5a5' if is_active else '#7dd3fc'
+    badge_text = 'AMBULANCE ON PREMISES' if is_active else 'AMBULANCE EXITED'
+    accent_color = '#dc2626' if is_active else '#0284c7'
+
+    safe_subject = html.escape(str(subject or 'Medanta Ambulance Alert'))
+    safe_title = html.escape(str(title or '🚑 Ambulance Gate Movement Advisory'))
+    summary_html = ''
+    if summary:
+        summary_html = (
+            f'<div style="margin-bottom:20px;padding:12px 16px;background-color:#f8fafc;'
+            f'border-left:4px solid {accent_color};border-radius:4px;font-size:14px;color:#334155;line-height:1.5;">'
+            f'{html.escape(str(summary))}</div>'
+        )
+
+    meta_rows = ''
+    for k, v in (metadata or {}).items():
+        if v is None or not str(v).strip():
+            continue
+        k_esc = html.escape(str(k))
+        v_str = str(v)
+        v_esc = html.escape(v_str)
+        v_low = v_str.lower()
+        if any(w in v_low for w in ('on premises', 'still on premises', 'emergency', 'urgent', 'priority')):
+            val_style = 'color:#b91c1c;font-weight:700;background-color:#fee2e2;padding:2px 6px;border-radius:4px;display:inline-block;'
+        elif any(w in v_low for w in ('exited', 'departed', 'cleared')):
+            val_style = 'color:#0369a1;font-weight:700;background-color:#e0f2fe;padding:2px 6px;border-radius:4px;display:inline-block;'
+        else:
+            val_style = 'color:#0f172a;font-weight:600;'
+        meta_rows += (
+            '<tr style="border-bottom:1px solid #f1f5f9;">'
+            f'<td style="padding:9px 12px;font-size:13px;color:#64748b;font-weight:600;width:38%;vertical-align:top;">{k_esc}</td>'
+            f'<td style="padding:9px 12px;font-size:13px;vertical-align:top;"><span style="{val_style}">{v_esc}</span></td>'
+            '</tr>'
+        )
+
+    evidence_section = ''
+    if has_plate_crop or has_vehicle_photo:
+        cols = []
+        if has_plate_crop:
+            cols.append(
+                '<td align="center" style="background-color:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:14px;vertical-align:top;">'
+                '<div style="font-size:11px;font-weight:700;color:#475569;text-transform:uppercase;margin-bottom:8px;">🪪 License Plate Crop</div>'
+                '<img src="cid:face_crop" alt="License Plate Crop" style="max-height:110px;max-width:100%;object-fit:contain;border-radius:6px;border:2px solid #cbd5e1;display:block;margin:0 auto;" />'
+                '<div style="font-size:10px;color:#94a3b8;margin-top:6px;">ANPR Plate Read</div></td>'
+            )
+        if has_vehicle_photo:
+            cols.append(
+                '<td align="center" style="background-color:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:14px;vertical-align:top;">'
+                '<div style="font-size:11px;font-weight:700;color:#475569;text-transform:uppercase;margin-bottom:8px;">🚑 Ambulance Vehicle Snapshot</div>'
+                '<img src="cid:body_crop" alt="Ambulance Snapshot" style="max-height:200px;max-width:100%;object-fit:contain;border-radius:6px;border:2px solid #cbd5e1;display:block;margin:0 auto;" />'
+                '<div style="font-size:10px;color:#94a3b8;margin-top:6px;">Gate Camera Capture</div></td>'
+            )
+        evidence_section = (
+            '<div style="margin-top:24px;padding-top:20px;border-top:1px solid #e2e8f0;">'
+            '<div style="font-size:13px;font-weight:800;color:#1e293b;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:14px;">'
+            '📷 Ambulance Visual Evidence</div>'
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:separate;border-spacing:10px 0;"><tr>{"".join(cols)}</tr></table>'
+            '</div>'
+        )
+
+    return f'''<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{safe_subject}</title></head>
+<body style="margin:0;padding:0;background-color:#f1f5f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#0f172a;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f1f5f9;padding:24px 12px;">
+<tr><td align="center">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:620px;background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 6px -1px rgba(0,0,0,0.1);border:1px solid #e2e8f0;">
+<tr><td style="background-color:#0f172a;padding:16px 24px;color:#ffffff;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+<td><div style="font-size:11px;text-transform:uppercase;letter-spacing:1.2px;color:#38bdf8;font-weight:700;">🏥 MEDANTA HOSPITAL OPERATIONS</div>
+<div style="font-size:16px;font-weight:800;color:#ffffff;margin-top:2px;">Ambulance &amp; Emergency Gate Tracker</div></td>
+<td align="right" style="vertical-align:middle;"><span style="display:inline-block;padding:4px 10px;border-radius:9999px;font-size:10px;font-weight:800;background-color:{badge_bg};color:{badge_color};border:1px solid {badge_border};text-transform:uppercase;">{badge_text}</span></td>
+</tr></table></td></tr>
+<tr><td style="padding:24px 24px 20px 24px;">
+<div style="font-size:18px;font-weight:800;color:#0f172a;margin-bottom:12px;">{safe_title}</div>
+{summary_html}
+<div style="border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;margin-top:14px;">
+<div style="background-color:#f8fafc;padding:8px 12px;font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.5px;border-bottom:1px solid #e2e8f0;">Ambulance Movement Details</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">{meta_rows}</table>
+</div>
+{evidence_section}
+</td></tr>
+<tr><td style="background-color:#f8fafc;padding:16px 24px;border-top:1px solid #e2e8f0;text-align:center;">
+<div style="font-size:11px;color:#64748b;line-height:1.4;">Dispatched via <strong>Medanta Hospital AI Ops Suite</strong> • Ambulance &amp; Vehicle Tracker.</div>
+<div style="font-size:10px;color:#94a3b8;margin-top:4px;">GoDezk AI Vision Fleet • Powered by AWS SES</div>
+</td></tr></table></td></tr></table></body></html>'''
+
+def relay_email_dispatch(payload):
+    """Send email dispatch JSON payload to centralized 31040 AWS SES microservice."""
+    raw_body = json.dumps(payload).encode('utf-8')
+    last_net_err = None
+    urls = [u.strip() for u in os.environ.get('EMAIL_DISPATCH_URL', '').split(',') if u.strip()] or EMAIL_DISPATCH_URLS
+    for url in urls:
+        req = urllib.request.Request(url, data=raw_body, headers={'Content-Type': 'application/json'}, method='POST')
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+        except urllib.error.HTTPError as http_err:
+            err_body = http_err.read().decode('utf-8', errors='replace')
+            try:
+                detail = json.loads(err_body).get('detail', err_body)
+            except Exception:
+                detail = err_body or str(http_err)
+            raise RuntimeError(f'Email service error ({http_err.code}): {detail}')
+        except (urllib.error.URLError, OSError, TimeoutError) as net_err:
+            last_net_err = net_err
+            continue
+    raise RuntimeError(f'Could not reach Email Dispatch service on port 31040: {last_net_err}')
 def http_json(url, body=None, key=KEY, timeout=15):
     request = urllib.request.Request(url, data=json.dumps(body).encode() if body is not None else None,
                                      headers={'X-Local-Vision-Key': key, 'Content-Type': 'application/json'})
@@ -1797,13 +2152,37 @@ class Engine:
         type_scores = tr.get('type_scores')
         if not type_scores:
             return self._resolve_track_type(tr.get('types'))
-        best_type = max(VEHICLE_TYPES, key=lambda t: (type_scores.get(t, 0.0), 1 if t == 'car' else 0))
+        types_cnt = tr.get('types') or {}
+        amb_cnt = int(types_cnt.get('ambulance', 0))
+        car_cnt = int(types_cnt.get('car', 0))
+        amb_w = float(type_scores.get('ambulance', 0.0))
+        car_w = float(type_scores.get('car', 0.0))
+        allow_amb = (
+            amb_cnt >= 3
+            and amb_cnt > car_cnt
+            and amb_w >= max(1.90, car_w * 1.35)
+        )
+        cand_types = VEHICLE_TYPES if allow_amb else ('car', 'auto', 'bike')
+        best_type = max(cand_types, key=lambda t: (type_scores.get(t, 0.0), 1 if t == 'car' else 0))
+        if best_type in ('auto', 'bike') and car_w > 0.0:
+            bt_cnt = int(types_cnt.get(best_type, 0))
+            bt_w = float(type_scores.get(best_type, 0.0))
+            if bt_cnt < 2 and bt_w < max(0.45, car_w * 1.15):
+                best_type = 'car'
         cur = tr.get('resolved_type')
         if cur and best_type != cur and tr.get('type_confirmed'):
+            if cur == 'ambulance' and not allow_amb:
+                tr['resolved_type'] = best_type
+                return best_type
             cur_w = type_scores.get(cur, 0.0)
             best_w = type_scores.get(best_type, 0.0)
-            best_cnt = tr['types'].get(best_type, 0)
-            margin = 1.15 if best_type == 'ambulance' else 1.40
+            best_cnt = types_cnt.get(best_type, 0)
+            if cur == 'ambulance' and best_type == 'car':
+                margin = 1.15
+            elif best_type == 'ambulance':
+                margin = 1.35
+            else:
+                margin = 1.40
             if best_cnt < 2 or best_w < cur_w * margin:
                 return cur
         tr['resolved_type'] = best_type
@@ -1907,15 +2286,25 @@ class Engine:
         orphan_dets = []
         for det in detections:
             dc = det['quad'].mean(axis=0)
+            has_vbox = bool(det.get('matched_v', True))
             best_di, best_dm = None, 0.0
             for di, dv in enumerate(valid_vehicles):
                 vx1, vy1, vx2, vy2 = dv['bbox']
-                iou = self._bbox_iou(dv['bbox'], det.get('vehicle_bbox', dv['bbox']))
-                inside = (vx1 - 25) <= dc[0] <= (vx2 + 25) and (vy1 - 25) <= dc[1] <= (vy2 + 25)
-                m_val = iou + (0.5 if inside else 0.0)
+                vw, vh = max(1.0, vx2 - vx1), max(1.0, vy2 - vy1)
+                strict_in = vx1 <= dc[0] <= vx2 and vy1 <= dc[1] <= vy2
+                loose_in = (vx1 - 6) <= dc[0] <= (vx2 + 6) and (vy1 - 6) <= dc[1] <= (vy2 + 6)
+                if not loose_in and not has_vbox:
+                    continue
+                iou = self._bbox_iou(dv['bbox'], det['vehicle_bbox']) if (has_vbox and det.get('vehicle_bbox')) else 0.0
+                if not loose_in and iou < 0.35:
+                    continue
+                rel_x = abs(dc[0] - (vx1 + vx2) / 2.0) / (vw * 0.5)
+                rel_y = (dc[1] - vy1) / vh
+                bumper = (0.30 if 0.35 <= rel_y <= 0.98 else 0.0) + max(0.0, 1.0 - min(1.5, rel_x)) * 0.35
+                m_val = iou + (0.65 if strict_in else (0.30 if loose_in else 0.0)) + bumper
                 if m_val > best_dm:
                     best_dm, best_di = m_val, di
-            if best_di is not None and best_dm > 0.1:
+            if best_di is not None and best_dm > 0.15:
                 valid_vehicles[best_di]['matched_dets'].append(det)
                 det['_track_di'] = best_di
             else:
@@ -2308,8 +2697,7 @@ class Engine:
                                 coactive = {p for o_tid, p in visible_plates.items() if o_tid != tid}
                                 best_det = tr.get('best_plate_det') or {}
                                 det_score = float(best_det.get('score', tr['best_score']))
-                                best_ocr = float(best_det.get('ocr_conf', 0.0))
-                                ready_for_sighting = (tr['hits'] >= 2) or (best_ocr >= 0.90)
+                                ready_for_sighting = (tr['hits'] >= 2)
                                 if ready_for_sighting and not tr.get('sighting_id') and not tr.get('sighting_suppressed'):
                                     seen_match = next(
                                         (sp for sp in worker['seen'] if sp not in coactive and are_plates_similar_vc(sp, plate, allow_single_edit=True)),
@@ -2583,16 +2971,24 @@ class Handler(BaseHTTPRequestHandler):
             if path_str == '/journeys':
                 hours = min(720, max(1, float(query.get('hours', ['24'])[0])))
                 plate = query.get('plate', [None])[0]
+                vtype_filter = (query.get('type', [None])[0] or query.get('vehicle_type', [None])[0] or '').strip().lower()
                 result = journeys(self.store, int(time.time() * 1000 - hours * 3600000), plate)
+                if vtype_filter and vtype_filter != 'all':
+                    norm_vt = normalize_vehicle_type(vtype_filter)
+                    result = [v for v in result if normalize_vehicle_type(v.get('vehicle_type')) == norm_vt]
                 return self.send_json(200, {'journeys': result, 'count': len(result)})
             if path_str in ('/journeys.csv', '/journeys/export'):
                 hours = min(720, max(1, float(query.get('hours', ['24'])[0])))
                 plate = query.get('plate', [None])[0]
                 status_filter = query.get('status', [None])[0]
                 camera_filter = query.get('camera', [None])[0]
+                vtype_filter = (query.get('type', [None])[0] or query.get('vehicle_type', [None])[0] or '').strip().lower()
                 result = journeys(self.store, int(time.time() * 1000 - hours * 3600000), plate)
                 if status_filter:
                     result = [v for v in result if v['status'] == status_filter]
+                if vtype_filter and vtype_filter != 'all':
+                    norm_vt = normalize_vehicle_type(vtype_filter)
+                    result = [v for v in result if normalize_vehicle_type(v.get('vehicle_type')) == norm_vt]
                 if camera_filter:
                     result = [v for v in result if any(c['stream'] == camera_filter for c in v['cameras'])
                               or (v.get('entry') or {}).get('stream') == camera_filter
@@ -2600,7 +2996,7 @@ class Handler(BaseHTTPRequestHandler):
                 import csv, io
                 out = io.StringIO()
                 writer = csv.writer(out)
-                writer.writerow(['S.No', 'License Plate', 'Status', 'Entry Camera', 'Entry Date & Time',
+                writer.writerow(['S.No', 'License Plate', 'Vehicle Type', 'Status', 'Entry Camera', 'Entry Date & Time',
                                  'Exit Camera', 'Exit Date & Time', 'Dwell Duration', 'Dwell (Minutes)',
                                  'Cameras Visited', 'Total Reads', 'Entry Vehicle Photo URL', 'Exit Vehicle Photo URL'])
                 host_header = self.headers.get('Host', '124.123.89.162:31016')
@@ -2616,8 +3012,8 @@ class Handler(BaseHTTPRequestHandler):
                     exit_info = j.get('exit') or {}
                     entry_photo = f"{base_url}{entry_info['photo_url']}" if entry_info.get('photo_url') else ''
                     exit_photo = f"{base_url}{exit_info['photo_url']}" if exit_info.get('photo_url') else ''
-                    writer.writerow([idx, j['plate'], j['status'].upper(), entry_info.get('device', '—'),
-                                     first_ts, exit_info.get('device', '—'),
+                    writer.writerow([idx, j['plate'], normalize_vehicle_type(j.get('vehicle_type')).upper(), j['status'].upper(),
+                                     entry_info.get('device', '—'), first_ts, exit_info.get('device', '—'),
                                      last_ts, dwell_str, dwell_min, cams, j.get('reads', 1), entry_photo, exit_photo])
                 payload = out.getvalue().encode('utf-8-sig')
                 self.send_response(200)
@@ -2635,13 +3031,24 @@ class Handler(BaseHTTPRequestHandler):
             if path_str == '/passages':
                 hours = min(720, max(1, float(query.get('hours', ['24'])[0])))
                 return self.send_json(200, {'passages': self.store.passages(int(time.time() * 1000 - hours * 3600000))})
+            if path_str == '/ambulances':
+                hours_q = str(query.get('hours', ['24'])[0]).lower()
+                if hours_q == 'today':
+                    now_sec = int(time.time())
+                    hrs = max(0.25, ((now_sec + IST_OFFSET_SEC) % 86400) / 3600.0)
+                else:
+                    hrs = min(720, max(1, float(hours_q)))
+                limit_q = min(500, max(10, int(query.get('limit', ['200'])[0])))
+                return self.send_json(200, build_ambulance_list(self.store, hours=hrs, limit=limit_q))
             if path_str == '/vehicle-counts':
                 now_ms = int(time.time() * 1000)
                 from_q = query.get('from_ts', [None])[0]
                 to_q = query.get('to_ts', [None])[0]
                 hours_q = query.get('hours', ['24'])[0]
-                granularity = query.get('granularity', ['hourly'])[0]
-                limit_q = min(500, max(10, int(query.get('limit', ['60'])[0])))
+                granularity = query.get('granularity', ['auto'])[0]
+                direction_q = query.get('direction', [None])[0]
+                vtype_q = query.get('type', [None])[0]
+                limit_q = min(20000, max(10, int(query.get('limit', ['60'])[0])))
                 if from_q is not None:
                     from_ts = max(0, int(float(from_q)))
                     to_ts = int(float(to_q)) if to_q is not None else now_ms
@@ -2657,7 +3064,10 @@ class Handler(BaseHTTPRequestHandler):
                     hours_val = max(0.25, float(hours_q))
                     from_ts = int(now_ms - hours_val * 3600000)
                     to_ts = now_ms
-                summary = self.store.vehicle_counts_summary(from_ts=from_ts, to_ts=to_ts, granularity=granularity, event_limit=limit_q)
+                summary = self.store.vehicle_counts_summary(
+                    from_ts=from_ts, to_ts=to_ts, granularity=granularity,
+                    event_limit=limit_q, direction=direction_q, vehicle_type=vtype_q
+                )
                 summary['remaining_cameras_live'] = self.engine.remaining_cameras_live()
                 return self.send_json(200, summary)
             if path_str in ('/vehicle-counts.csv', '/vehicle-counts/export'):
@@ -2834,7 +3244,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path_str = parsed.path
         if path_str.startswith('/api'):
-            path_str = path_str[4:] or '/'
+             path_str = path_str[4:] or '/'
         try:
             data = self.body()
             if path_str in ('/feed-source', '/api/feed-source', '/feed-source/toggle', '/api/feed-source/toggle'):
@@ -2852,7 +3262,7 @@ class Handler(BaseHTTPRequestHandler):
                     enabled=data.get('enabled', True),
                     gate_group=data.get('gate_group', ''),
                     count_enabled=data.get('count_enabled', True)
-                )
+                      )
                 self.engine.drop(device['stream'])
                 self.engine.sync()
                 return self.send_json(200, {'device': device, 'devices': self.store.devices()})
@@ -2874,6 +3284,82 @@ class Handler(BaseHTTPRequestHandler):
                 plate_photo = base64.b64decode(data['plate_b64']) if data.get('plate_b64') else None
                 sid = self.store.save_sighting(stream, plate, data.get('confidence'), int(data.get('ts') or time.time() * 1000), photo, plate_photo)
                 return self.send_json(200, {'id': sid})
+            if path_str == '/ambulances/dispatch-email':
+                raw_to = data.get('to') or []
+                if isinstance(raw_to, str):
+                    raw_to = [x.strip() for x in raw_to.split(',')]
+                to_list = [str(x).strip() for x in raw_to if x and '@' in str(x)]
+                if not to_list:
+                    return self.send_json(400, {'error': "At least one valid recipient email ('to') is required."})
+                raw_cc = data.get('cc') or []
+                if isinstance(raw_cc, str):
+                    raw_cc = [x.strip() for x in raw_cc.split(',')]
+                cc_list = [str(x).strip() for x in raw_cc if x and '@' in str(x)]
+                subject = str(data.get('subject') or 'Medanta Ambulance Alert').strip()
+                title = str(data.get('title') or '🚑 Ambulance Movement Advisory').strip()
+                summary = str(data.get('summary') or '').strip()
+                status_tag = str(data.get('status') or 'on_site').strip()
+                metadata = dict(data.get('metadata') or {})
+                note = str(data.get('note') or '').strip()
+                if note:
+                    metadata['Dispatcher Note'] = note
+
+                # Attach JPEG snapshots from sightings DB (fallback to inline base64 if supplied)
+                sids = [s for s in (data.get('exit_sighting_id'), data.get('entry_sighting_id'), data.get('sighting_id')) if s]
+                veh_b64 = data.get('photo_b64') or data.get('body_crop_base64') or None
+                plate_b64 = data.get('plate_b64') or data.get('face_crop_base64') or None
+                for sid in sids:
+                    if not veh_b64:
+                        blob = self.store.sighting_photo(sid, 'photo')
+                        if blob:
+                            veh_b64 = base64.b64encode(blob).decode('ascii')
+                    if not plate_b64:
+                        pblob = self.store.sighting_photo(sid, 'plate')
+                        if pblob:
+                            plate_b64 = base64.b64encode(pblob).decode('ascii')
+
+                custom_html = build_ambulance_email_html(
+                    subject=subject,
+                    title=title,
+                    summary=summary,
+                    metadata=metadata,
+                    status_tag=status_tag,
+                    has_plate_crop=bool(plate_b64),
+                    has_vehicle_photo=bool(veh_b64),
+                )
+                dispatch_payload = {
+                    'to': to_list,
+                    'cc': cc_list,
+                    'subject': subject,
+                    'alert_type': 'general_alert',
+                    'title': title,
+                    'summary': summary,
+                    'metadata': metadata,
+                    'face_crop_base64': plate_b64,
+                    'body_crop_base64': veh_b64,
+                    'custom_html': custom_html,
+                }
+                try:
+                    resp = relay_email_dispatch(dispatch_payload)
+                except RuntimeError as err:
+                    return self.send_json(502, {'error': str(err)[:300]})
+                saved = record_ambulance_dispatch(
+                    self.store,
+                    ref_id=str(data.get('ref_id') or ''),
+                    plate=str(data.get('plate') or ''),
+                    recipients=to_list,
+                    subject=subject,
+                    note=note,
+                    message_id=str(resp.get('message_id') or ''),
+                )
+                return self.send_json(200, {
+                    'success': True,
+                    'message_id': resp.get('message_id'),
+                    'to': to_list,
+                    'cc': cc_list,
+                    'images_attached': {'plate_crop': bool(plate_b64), 'vehicle_photo': bool(veh_b64)},
+                    'dispatch': saved,
+                })
             return self.send_json(404, {'error': 'Not found'})
         except Exception as error:
             return self.send_json(400, {'error': str(error)[:200]})

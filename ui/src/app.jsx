@@ -715,11 +715,23 @@ function RegisteredCameras({ devices, activeSlots, onToggleViewSlot, onEditCamer
 function JourneyFlow({ journey, expanded, onToggle, onOpenSightingPhoto }) {
   if (!journey) return null;
   const cameras = journey.cameras || [];
+  const vtypeKey = String(journey.vehicle_type || 'car').toLowerCase();
+  const vtMeta = VEHICLE_TYPE_META.find(v => v.key === vtypeKey) || VEHICLE_TYPE_META[0];
 
   return (
     <>
       <tr className="expandable clickable-row" onClick={onToggle}>
         <td><span className="plate">{journey.plate}</span></td>
+        <td>
+          <span style={{
+            display: 'inline-flex', alignItems: 'center', gap: 4, padding: '2px 8px',
+            borderRadius: 6, background: vtMeta.bg, color: vtMeta.color,
+            fontSize: 10, fontWeight: 800, whiteSpace: 'nowrap'
+          }}>
+            <span>{vtMeta.icon}</span>
+            <span>{vtMeta.singular}</span>
+          </span>
+        </td>
         <td>
           <span className={`badge ${journey.status}`}>
             {journey.status === 'on_site' ? '🟢 ON SITE' : '🔵 EXITED'}
@@ -741,10 +753,17 @@ function JourneyFlow({ journey, expanded, onToggle, onOpenSightingPhoto }) {
       </tr>
       {expanded && (
         <tr className="journey-detail">
-          <td colSpan={9} style={{ padding: '12px 16px', background: '#f8fafd' }}>
+          <td colSpan={10} style={{ padding: '12px 16px', background: '#f8fafd' }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-              <div style={{ fontSize: 12, fontWeight: 800, color: '#26334a' }}>
-                🚗 Vehicle Travel Timeline & Correlation — <span className="plate">{journey.plate}</span>
+              <div style={{ fontSize: 12, fontWeight: 800, color: '#26334a', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <span>🚗 Vehicle Travel Timeline & Correlation — <span className="plate">{journey.plate}</span></span>
+                <span style={{
+                  display: 'inline-flex', alignItems: 'center', gap: 4, padding: '2px 8px',
+                  borderRadius: 6, background: vtMeta.bg, color: vtMeta.color,
+                  fontSize: 10, fontWeight: 800
+                }}>
+                  {vtMeta.icon} {vtMeta.singular}
+                </span>
               </div>
               <span className={`badge ${journey.status}`}>
                 {journey.status === 'on_site' ? '🟢 Currently On Hospital Grounds' : '🔵 Journey Complete / Exited'}
@@ -776,6 +795,7 @@ function JourneyFlow({ journey, expanded, onToggle, onOpenSightingPhoto }) {
                   onClick={(e) => {
                     e.stopPropagation();
                     onOpenSightingPhoto({
+                      id: journey.entry.id,
                       photo_url: journey.entry.photo_url,
                       plate: journey.plate,
                       stream: journey.entry.stream || journey.entry.device,
@@ -796,6 +816,7 @@ function JourneyFlow({ journey, expanded, onToggle, onOpenSightingPhoto }) {
                   onClick={(e) => {
                     e.stopPropagation();
                     onOpenSightingPhoto({
+                      id: journey.exit.id,
                       photo_url: journey.exit.photo_url,
                       plate: journey.plate,
                       stream: journey.exit.stream || journey.exit.device,
@@ -1223,10 +1244,10 @@ function GateAnalyticsCard({ analytics, devices, timeFilter, setTimeFilter }) {
 /* ── Security Gate Vehicle Counts (Incoming/Outgoing DB + Remaining Live) ── */
 
 const VEHICLE_TYPE_META = [
-  { key: 'car', label: 'Cars', icon: '🚗', color: '#235496', bg: '#eaf1fa' },
-  { key: 'bike', label: 'Bikes', icon: '🏍️', color: '#6932b5', bg: '#f3effc' },
-  { key: 'auto', label: 'Autos', icon: '🛺', color: '#147a6d', bg: '#e7f7f4' },
-  { key: 'ambulance', label: 'Ambulances', icon: '🚑', color: '#b82323', bg: '#feebeb' },
+  { key: 'car', label: 'Cars', singular: 'Car', icon: '🚗', color: '#235496', bg: '#eaf1fa' },
+  { key: 'bike', label: 'Bikes', singular: 'Bike', icon: '🏍️', color: '#6932b5', bg: '#f3effc' },
+  { key: 'auto', label: 'Autos', singular: 'Auto', icon: '🛺', color: '#147a6d', bg: '#e7f7f4' },
+  { key: 'ambulance', label: 'Ambulances', singular: 'Ambulance', icon: '🚑', color: '#b82323', bg: '#feebeb' },
 ];
 
 function SecurityVehicleCountsCard({
@@ -1422,6 +1443,161 @@ function OtherCamerasLiveCard({ remaining = [] }) {
 
 /* ── Historical Incoming & Outgoing Security Modal ─────────── */
 
+function exportGateHistoryToExcel({ data, rangeLabel, granularity, dirFilter, typeFilter }) {
+  const wb = XLSX.utils.book_new();
+  const inc = data?.incoming || { car: 0, bike: 0, auto: 0, ambulance: 0, total: 0 };
+  const out = data?.outgoing || { car: 0, bike: 0, auto: 0, ambulance: 0, total: 0 };
+  const resolvedGranularity = data?.window?.granularity || granularity || 'hourly';
+  const isDaily = resolvedGranularity === 'daily';
+
+  const typeEntries = typeFilter === 'all'
+    ? VEHICLE_TYPE_META
+    : VEHICLE_TYPE_META.filter(vt => vt.key === typeFilter);
+
+  const showIn = dirFilter !== 'outgoing';
+  const showOut = dirFilter !== 'incoming';
+
+  // Build Summary & Gate-wise tables
+  const summaryHeader = ['Vehicle Type'];
+  if (showIn) summaryHeader.push('Incoming');
+  if (showOut) summaryHeader.push('Outgoing');
+  if (showIn && showOut) summaryHeader.push('Net Flow');
+
+  const summaryRows = typeEntries.map(vt => {
+    const iVal = Number(inc[vt.key] || 0);
+    const oVal = Number(out[vt.key] || 0);
+    const row = [vt.label];
+    if (showIn) row.push(iVal);
+    if (showOut) row.push(oVal);
+    if (showIn && showOut) row.push(iVal - oVal);
+    return row;
+  });
+  if (typeFilter === 'all') {
+    const totIn = Number(inc.total || 0);
+    const totOut = Number(out.total || 0);
+    const totRow = ['Total Gate Flow'];
+    if (showIn) totRow.push(totIn);
+    if (showOut) totRow.push(totOut);
+    if (showIn && showOut) totRow.push(totIn - totOut);
+    summaryRows.push(totRow);
+  }
+
+  const camFiltered = (data?.by_camera || []).filter(c => dirFilter === 'all' || c.direction === dirFilter);
+  const camHeader = ['Gate Camera', 'Direction', ...typeEntries.map(vt => vt.label), 'Total'];
+  const camRows = camFiltered.map(c => {
+    const vals = typeEntries.map(vt => Number(c[vt.key] || 0));
+    const total = typeFilter === 'all' ? Number(c.total || 0) : vals[0];
+    return [c.name, (c.direction || '').toUpperCase(), ...vals, total];
+  });
+
+  // Build Time-Bucket Breakdown table (selected Hourly or Daily granularity)
+  const timeHeader = ['Time Period (IST)'];
+  if (showIn) {
+    typeEntries.forEach(vt => timeHeader.push(`In ${vt.label}`));
+    if (typeFilter === 'all') timeHeader.push('In Total');
+  }
+  if (showOut) {
+    typeEntries.forEach(vt => timeHeader.push(`Out ${vt.label}`));
+    if (typeFilter === 'all') timeHeader.push('Out Total');
+  }
+  if (showIn && showOut) timeHeader.push('Net Flow');
+
+  const histList = [...(data?.history || [])].reverse();
+  const totalsAcc = new Array(Math.max(0, timeHeader.length - 1)).fill(0);
+  const timeRows = histList.map(b => {
+    const d = new Date(b.bucket);
+    const lbl = isDaily
+      ? d.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric' })
+      : d.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: true });
+    const i = b.incoming || {};
+    const o = b.outgoing || {};
+    const nums = [];
+    let inSum = 0;
+    let outSum = 0;
+    if (showIn) {
+      typeEntries.forEach(vt => nums.push(Number(i[vt.key] || 0)));
+      inSum = typeFilter === 'all' ? Number(i.total || 0) : Number(i[typeFilter] || 0);
+      if (typeFilter === 'all') nums.push(inSum);
+    }
+    if (showOut) {
+      typeEntries.forEach(vt => nums.push(Number(o[vt.key] || 0)));
+      outSum = typeFilter === 'all' ? Number(o.total || 0) : Number(o[typeFilter] || 0);
+      if (typeFilter === 'all') nums.push(outSum);
+    }
+    if (showIn && showOut) nums.push(inSum - outSum);
+    nums.forEach((n, idx) => { totalsAcc[idx] += n; });
+    return [lbl, ...nums];
+  });
+  if (timeRows.length > 0) {
+    timeRows.push(['TOTAL', ...totalsAcc]);
+  }
+
+  const timeSectionTitle = isDaily
+    ? 'DAILY INCOMING & OUTGOING BREAKDOWN'
+    : 'HOURLY INCOMING & OUTGOING BREAKDOWN';
+
+  // Sheet 1: Complete Gate Audit Overview (Summary + Gate-wise + Selected Hourly/Daily Breakdown)
+  const nowIst = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: true });
+  const sheet1AoA = [
+    ['Medanta Hospital — Gate Vehicle Counts & Security Audit'],
+    ['Generated (IST)', nowIst, 'Window', rangeLabel],
+    ['Granularity', isDaily ? 'Daily Buckets' : 'Hourly Buckets', 'Direction', dirFilter === 'all' ? 'All Directions' : dirFilter.toUpperCase()],
+    ['Vehicle Type Filter', typeFilter === 'all' ? 'All Vehicle Types' : typeFilter.toUpperCase()],
+    [],
+    ['SUMMARY BY VEHICLE TYPE'],
+    summaryHeader,
+    ...summaryRows,
+    [],
+    ['GATE-WISE BREAKDOWN'],
+    camHeader,
+    ...(camRows.length > 0 ? camRows : [['No gate breakdown records in selected window']]),
+    [],
+    [timeSectionTitle],
+    timeHeader,
+    ...(timeRows.length > 0 ? timeRows : [['No historical gate vehicle records in selected window']])
+  ];
+  const maxColsS1 = Math.max(camHeader.length, timeHeader.length, 7);
+  const ws1 = XLSX.utils.aoa_to_sheet(sheet1AoA);
+  ws1['!cols'] = [{ wch: 28 }, { wch: 20 }, ...new Array(maxColsS1 - 2).fill(0).map(() => ({ wch: 14 }))];
+  XLSX.utils.book_append_sheet(wb, ws1, 'Gate Audit Summary');
+
+  // Sheet 2: Dedicated Selected Hourly or Daily Breakdown Tab
+  const ws2 = XLSX.utils.aoa_to_sheet([timeHeader, ...(timeRows.length > 0 ? timeRows : [['No records']])]);
+  ws2['!cols'] = [{ wch: 26 }, ...timeHeader.slice(1).map(() => ({ wch: 14 }))];
+  XLSX.utils.book_append_sheet(wb, ws2, isDaily ? 'Daily Breakdown' : 'Hourly Breakdown');
+
+  // Sheet 3: Tracked Gate Events Log
+  const evFiltered = (data?.recent_events || []).filter(ev => {
+    if (dirFilter !== 'all' && ev.direction !== dirFilter) return false;
+    if (typeFilter !== 'all' && ev.vehicle_type !== typeFilter) return false;
+    return true;
+  });
+  const evHeaders = ['S.No', 'Date & Time (IST)', 'Direction', 'Gate Camera', 'Gate Group', 'Matched Cameras', 'Vehicle Type', 'License Plate', 'Confidence (%)'];
+  const evRows = evFiltered.map((ev, idx) => [
+    idx + 1,
+    tsDate(ev.ts),
+    (ev.direction || '').toUpperCase(),
+    ev.camera || '—',
+    ev.gate_group || 'Default',
+    (ev.merged_cameras && ev.merged_cameras.length > 0) ? ev.merged_cameras.join(', ') : (ev.camera || '—'),
+    (ev.vehicle_type || '').toUpperCase(),
+    ev.plate || '—',
+    ev.confidence != null ? Math.round(ev.confidence * 100) : '—'
+  ]);
+  const ws3 = XLSX.utils.aoa_to_sheet([evHeaders, ...evRows]);
+  ws3['!cols'] = [
+    { wch: 7 }, { wch: 24 }, { wch: 12 }, { wch: 24 },
+    { wch: 16 }, { wch: 28 }, { wch: 14 }, { wch: 16 }, { wch: 14 }
+  ];
+  XLSX.utils.book_append_sheet(wb, ws3, 'Tracked Gate Events');
+
+  const now = new Date();
+  const istDate = now.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+  const istTime = now.toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: false }).replace(':', '-');
+  XLSX.writeFile(wb, `Medanta_Gate_Vehicle_Counts_${istDate}_${istTime}.xlsx`);
+  return evFiltered.length;
+}
+
 function VehicleHistoryModal({ open, onClose, initialData }) {
   const [histRange, setHistRange] = useState('24h');
   const [fromStr, setFromStr] = useState(() => {
@@ -1434,27 +1610,37 @@ function VehicleHistoryModal({ open, onClose, initialData }) {
   const [typeFilter, setTypeFilter] = useState('all');
   const [histData, setHistData] = useState(initialData || null);
   const [loading, setLoading] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [exportMsg, setExportMsg] = useState(null);
+
+  const buildQuery = useCallback((limitVal = 200, includeFilters = false) => {
+    let qs = `granularity=${granularity}&limit=${limitVal}`;
+    if (histRange === 'custom') {
+      const fMs = new Date(fromStr).getTime() || 0;
+      const tMs = new Date(toStr).getTime() || Date.now();
+      qs += `&from_ts=${fMs}&to_ts=${tMs}`;
+    } else {
+      qs += `&hours=${histRange === '7d' ? '168' : histRange === '30d' ? '720' : histRange === '24h' ? '24' : histRange}`;
+    }
+    if (includeFilters) {
+      if (dirFilter !== 'all') qs += `&direction=${encodeURIComponent(dirFilter)}`;
+      if (typeFilter !== 'all') qs += `&type=${encodeURIComponent(typeFilter)}`;
+    }
+    return qs;
+  }, [histRange, fromStr, toStr, granularity, dirFilter, typeFilter]);
 
   const fetchHistory = useCallback(async () => {
     if (!open) return;
     setLoading(true);
     try {
-      let qs = `granularity=${granularity}&limit=200`;
-      if (histRange === 'custom') {
-        const fMs = new Date(fromStr).getTime() || 0;
-        const tMs = new Date(toStr).getTime() || Date.now();
-        qs += `&from_ts=${fMs}&to_ts=${tMs}`;
-      } else {
-        qs += `&hours=${histRange === '7d' ? '168' : histRange === '30d' ? '720' : histRange === '24h' ? '24' : histRange}`;
-      }
-      const res = await api('/vehicle-counts?' + qs);
+      const res = await api('/vehicle-counts?' + buildQuery(200, false));
       setHistData(res);
     } catch (e) {
       console.error('Failed to load historical vehicle counts:', e);
     } finally {
       setLoading(false);
     }
-  }, [open, histRange, fromStr, toStr, granularity]);
+  }, [open, buildQuery]);
 
   useEffect(() => {
     fetchHistory();
@@ -1478,11 +1664,46 @@ function VehicleHistoryModal({ open, onClose, initialData }) {
     if (typeFilter !== 'all' && ev.vehicle_type !== typeFilter) return false;
     return true;
   });
+  const hasAnyRecords = (incoming.total || 0) > 0 || (outgoing.total || 0) > 0 || historyRows.length > 0 || events.length > 0;
+
+  const handleDownloadExcel = async () => {
+    if (!hasAnyRecords || exporting) return;
+    setExporting(true);
+    try {
+      let fullData = histData;
+      try {
+        fullData = await api('/vehicle-counts?' + buildQuery(10000, true));
+      } catch {
+        // Fallback to already loaded modal data if full fetch fails
+      }
+      const rangeNames = {
+        today: 'Today (IST)',
+        '24h': 'Last 24 Hours',
+        '7d': 'Last 7 Days',
+        '30d': 'Last 30 Days',
+        all: 'All Time',
+        custom: `${fromStr.replace('T', ' ')} to ${toStr.replace('T', ' ')}`
+      };
+      const evCount = exportGateHistoryToExcel({
+        data: fullData,
+        rangeLabel: rangeNames[histRange] || histRange,
+        granularity,
+        dirFilter,
+        typeFilter
+      });
+      setExportMsg(`✅ Exported Excel (${evCount} events)`);
+      setTimeout(() => setExportMsg(null), 4000);
+    } catch (err) {
+      alert('Error generating Excel: ' + err.message);
+    } finally {
+      setExporting(false);
+    }
+  };
 
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal-box" style={{ width: 920, maxWidth: '95vw', maxHeight: '90vh', display: 'flex', flexDirection: 'column' }} onClick={e => e.stopPropagation()}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '15px 20px', borderBottom: '1px solid #eef2f7', background: '#fbfcfe' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '15px 20px', borderBottom: '1px solid #eef2f7', background: '#fbfcfe', gap: 10, flexWrap: 'wrap' }}>
           <div>
             <h3 style={{ margin: 0, fontSize: 16, fontWeight: 800, color: '#172138' }}>
               🛡️ Historical Gate Vehicle Counts &amp; Security Audit Log
@@ -1491,7 +1712,35 @@ function VehicleHistoryModal({ open, onClose, initialData }) {
               Incoming &amp; outgoing vehicle breakdown saved permanently in database
             </small>
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            {exportMsg && (
+              <span className="badge" style={{ background: '#e3f6ef', color: '#17835c', fontSize: 11, fontWeight: 700 }}>
+                {exportMsg}
+              </span>
+            )}
+            <button
+              type="button"
+              className="btn sm"
+              onClick={handleDownloadExcel}
+              disabled={exporting || !hasAnyRecords}
+              style={{
+                background: hasAnyRecords ? '#17835c' : '#cbd5e1',
+                color: '#fff',
+                borderColor: hasAnyRecords ? '#17835c' : '#cbd5e1',
+                fontWeight: 700,
+                fontSize: 11,
+                padding: '6px 14px',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 6,
+                cursor: (hasAnyRecords && !exporting) ? 'pointer' : 'not-allowed',
+                boxShadow: hasAnyRecords ? '0 2px 8px -2px rgba(23,131,92,0.45)' : 'none'
+              }}
+              title="Download Gate Summary, Time Breakdown & Tracked Events as an Excel (.xlsx) workbook"
+            >
+              <span>📥</span>
+              <span>{exporting ? 'Generating Excel…' : 'Download Excel'}</span>
+            </button>
             <button className="btn sm" onClick={onClose} style={{ borderRadius: '50%', width: 30, height: 30, padding: 0 }}>✕</button>
           </div>
         </div>
@@ -1688,6 +1937,627 @@ function VehicleHistoryModal({ open, onClose, initialData }) {
   );
 }
 
+/* ── Ambulance Email Dispatch Modal (matches 31030/31040 flow) ── */
+
+function AmbulanceEmailDispatchModal({ alertData, onClose, onDispatched }) {
+  const [toInput, setToInput] = useState('');
+  const [subject, setSubject] = useState('');
+  const [note, setNote] = useState('');
+  const [sending, setSending] = useState(false);
+  const [feedback, setFeedback] = useState(null);
+
+  const quickPresets = [
+    { label: '+ Emergency Desk', email: 'emergency.desk@medanta.org' },
+    { label: '+ Security Control', email: 'security.desk@medanta.org' },
+    { label: '+ Ambulance Desk', email: 'ambulance.dispatch@medanta.org' },
+    { label: '+ Operations Lead', email: 'ops.lead@medanta.org' },
+    { label: '+ My Email', email: 'bellwetherinbox01@gmail.com' },
+  ];
+
+  useEffect(() => {
+    if (!alertData) return;
+    setSubject(alertData.subject || '');
+    setNote('');
+    setSending(false);
+    setFeedback(null);
+  }, [alertData]);
+
+  useEffect(() => {
+    if (!alertData) return;
+    const onKey = (e) => { if (e.key === 'Escape' && !sending) onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [alertData, sending, onClose]);
+
+  if (!alertData) return null;
+
+  const addPresetEmail = (email) => {
+    const existing = toInput.split(',').map(x => x.trim()).filter(Boolean);
+    if (!existing.includes(email)) {
+      existing.push(email);
+      setToInput(existing.join(', '));
+    }
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    const recipients = toInput.split(',').map(x => x.trim()).filter(x => x && x.includes('@'));
+    if (recipients.length === 0) {
+      setFeedback({ type: 'error', message: 'Please enter at least one valid recipient email address.' });
+      return;
+    }
+    setSending(true);
+    setFeedback(null);
+    try {
+      const res = await api('/ambulances/dispatch-email', {
+        ref_id: alertData.ref_id || '',
+        plate: alertData.plate || '',
+        to: recipients,
+        subject: subject.trim(),
+        title: alertData.title,
+        summary: alertData.summary,
+        status: alertData.status,
+        metadata: alertData.metadata || {},
+        note: note.trim(),
+        entry_sighting_id: alertData.entry_sighting_id || null,
+        exit_sighting_id: alertData.exit_sighting_id || null,
+      });
+      if (!res || res.error || !res.success) {
+        throw new Error(res?.error || res?.detail || 'Failed to dispatch ambulance alert email.');
+      }
+      setFeedback({
+        type: 'success',
+        message: `Ambulance dispatch email sent to ${recipients.length} recipient(s)!`,
+        messageId: res.message_id || ''
+      });
+      if (onDispatched) onDispatched(res);
+    } catch (err) {
+      setFeedback({
+        type: 'error',
+        message: err.message || 'Network error while reaching Email Dispatch service.'
+      });
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const hasPlateImg = Boolean(alertData.plate_url);
+  const hasPhotoImg = Boolean(alertData.photo_url);
+
+  return (
+    <div
+      style={{
+        position: 'fixed', inset: 0, backgroundColor: 'rgba(15, 23, 42, 0.75)',
+        backdropFilter: 'blur(4px)', display: 'flex', alignItems: 'center',
+        justifyContent: 'center', zIndex: 99999, padding: 16
+      }}
+      onClick={() => !sending && onClose()}
+    >
+      <div
+        style={{
+          backgroundColor: '#ffffff', borderRadius: 14, width: '100%', maxWidth: 680,
+          maxHeight: '90vh', overflowY: 'auto', boxShadow: '0 25px 50px -12px rgba(0,0,0,0.25)',
+          border: '1px solid #e2e8f0', display: 'flex', flexDirection: 'column'
+        }}
+        onClick={e => e.stopPropagation()}
+      >
+        {/* Header */}
+        <div style={{
+          padding: '16px 20px', borderBottom: '1px solid #f1f5f9', display: 'flex',
+          alignItems: 'center', justifyContent: 'space-between', backgroundColor: '#f8fafc',
+          borderTopLeftRadius: 14, borderTopRightRadius: 14
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <span style={{ fontSize: 20 }}>✉️</span>
+            <div>
+              <div style={{ fontSize: 15, fontWeight: 800, color: '#0f172a' }}>
+                Dispatch Ambulance Alert Email
+              </div>
+              <div style={{ fontSize: 11, color: '#64748b' }}>
+                Sends formal ambulance movement advisory via AWS SES (Port 31040) with vehicle &amp; plate capture
+              </div>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={sending}
+            style={{ border: 'none', background: 'transparent', fontSize: 18, cursor: 'pointer', color: '#94a3b8', padding: '4px 8px', borderRadius: 6 }}
+          >
+            ✕
+          </button>
+        </div>
+
+        {/* Form Body */}
+        <form onSubmit={handleSubmit} style={{ padding: 20, display: 'flex', flexDirection: 'column', gap: 16 }}>
+          {feedback && (
+            <div style={{
+              padding: '12px 16px', borderRadius: 8,
+              backgroundColor: feedback.type === 'success' ? '#f0fdf4' : '#fef2f2',
+              border: `1px solid ${feedback.type === 'success' ? '#bbf7d0' : '#fecaca'}`,
+              color: feedback.type === 'success' ? '#166534' : '#991b1b',
+              fontSize: 13, display: 'flex', flexDirection: 'column', gap: 4
+            }}>
+              <div style={{ fontWeight: 700, display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span>{feedback.type === 'success' ? '✓' : '⚠️'}</span>
+                <span>{feedback.message}</span>
+              </div>
+              {feedback.messageId && (
+                <div style={{ fontSize: 11, fontFamily: 'monospace', color: '#15803d' }}>
+                  SES Message ID: {feedback.messageId}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Recipients */}
+          <div>
+            <label style={{ display: 'block', fontSize: 12, fontWeight: 700, color: '#334155', marginBottom: 6 }}>
+              Send To (Email Address or comma-separated list) *
+            </label>
+            <input
+              type="text"
+              required
+              placeholder="e.g. emergency.desk@medanta.org, security.desk@medanta.org"
+              value={toInput}
+              onChange={e => setToInput(e.target.value)}
+              disabled={sending}
+              style={{ width: '100%', padding: '9px 12px', borderRadius: 8, border: '1px solid #cbd5e1', fontSize: 13, outline: 'none', boxSizing: 'border-box' }}
+            />
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', marginTop: 6 }}>
+              <span style={{ fontSize: 11, color: '#64748b', fontWeight: 600 }}>Quick add:</span>
+              {quickPresets.map(p => (
+                <button
+                  key={p.email}
+                  type="button"
+                  onClick={() => addPresetEmail(p.email)}
+                  disabled={sending}
+                  style={{
+                    border: '1px solid #e2e8f0', backgroundColor: '#f8fafc', color: '#475569',
+                    fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 9999, cursor: 'pointer'
+                  }}
+                >
+                  {p.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Subject */}
+          <div>
+            <label style={{ display: 'block', fontSize: 12, fontWeight: 700, color: '#334155', marginBottom: 6 }}>
+              Subject Line *
+            </label>
+            <input
+              type="text"
+              required
+              value={subject}
+              onChange={e => setSubject(e.target.value)}
+              disabled={sending}
+              style={{ width: '100%', padding: '9px 12px', borderRadius: 8, border: '1px solid #cbd5e1', fontSize: 13, outline: 'none', boxSizing: 'border-box' }}
+            />
+          </div>
+
+          {/* Attached Visual Evidence */}
+          {(hasPlateImg || hasPhotoImg) && (
+            <div style={{ backgroundColor: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 10, padding: '12px 14px' }}>
+              <div style={{ fontSize: 11, fontWeight: 800, color: '#475569', textTransform: 'uppercase', marginBottom: 8, letterSpacing: 0.4 }}>
+                📷 Attached Visual Evidence
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: (hasPlateImg && hasPhotoImg) ? '1fr 1fr' : '1fr', gap: 12 }}>
+                {hasPlateImg && (
+                  <div style={{ textAlign: 'center', backgroundColor: '#fff', padding: 8, borderRadius: 8, border: '1px solid #e2e8f0' }}>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: '#64748b', marginBottom: 6 }}>🪪 LICENSE PLATE CROP</div>
+                    <img
+                      src={`${API}${alertData.plate_url}`}
+                      alt="License Plate Crop"
+                      style={{ height: 100, maxWidth: '100%', objectFit: 'contain', borderRadius: 6, border: '1px solid #cbd5e1', display: 'inline-block' }}
+                    />
+                  </div>
+                )}
+                {hasPhotoImg && (
+                  <div style={{ textAlign: 'center', backgroundColor: '#fff', padding: 8, borderRadius: 8, border: '1px solid #e2e8f0' }}>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: '#64748b', marginBottom: 6 }}>🚑 AMBULANCE SNAPSHOT</div>
+                    <img
+                      src={`${API}${alertData.photo_url}`}
+                      alt="Ambulance Vehicle"
+                      style={{ height: 110, maxWidth: '100%', objectFit: 'contain', borderRadius: 6, border: '1px solid #cbd5e1', display: 'inline-block' }}
+                    />
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Metadata Summary */}
+          {alertData.metadata && Object.keys(alertData.metadata).length > 0 && (
+            <div style={{ backgroundColor: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 14px' }}>
+              <div style={{ fontSize: 11, fontWeight: 800, color: '#475569', textTransform: 'uppercase', marginBottom: 6 }}>
+                📋 Ambulance Movement Metadata
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: 8 }}>
+                {Object.entries(alertData.metadata).map(([k, v]) => (
+                  <div key={k} style={{ fontSize: 11 }}>
+                    <span style={{ color: '#64748b', fontWeight: 600 }}>{k}: </span>
+                    <span style={{ color: '#0f172a', fontWeight: 700 }}>{String(v)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Dispatcher Note */}
+          <div>
+            <label style={{ display: 'block', fontSize: 12, fontWeight: 700, color: '#334155', marginBottom: 6 }}>
+              Dispatcher Note / Instructions (Optional)
+            </label>
+            <textarea
+              rows={2}
+              placeholder="e.g. Ambulance arrived at Main Gate; please clear Emergency Bay & notify ER triage desk."
+              value={note}
+              onChange={e => setNote(e.target.value)}
+              disabled={sending}
+              style={{ width: '100%', padding: '8px 12px', borderRadius: 8, border: '1px solid #cbd5e1', fontSize: 12, outline: 'none', boxSizing: 'border-box', resize: 'none' }}
+            />
+          </div>
+
+          {/* Actions */}
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 10, borderTop: '1px solid #f1f5f9', paddingTop: 16, marginTop: 4 }}>
+            <button
+              type="button"
+              onClick={onClose}
+              disabled={sending}
+              style={{ padding: '8px 16px', borderRadius: 8, border: '1px solid #cbd5e1', backgroundColor: '#fff', color: '#475569', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}
+            >
+              {feedback?.type === 'success' ? 'Close' : 'Cancel'}
+            </button>
+            <button
+              type="submit"
+              disabled={sending}
+              style={{
+                padding: '8px 20px', borderRadius: 8, border: 'none',
+                backgroundColor: sending ? '#94a3b8' : '#0284c7', color: '#fff',
+                fontSize: 12, fontWeight: 700, cursor: sending ? 'not-allowed' : 'pointer'
+              }}
+            >
+              {sending ? 'Dispatching…' : '✉️ Dispatch Email'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+/* ── Bottom Full-Width Ambulance List & Dispatch Card ──────── */
+
+function AmbulanceRegistryCard({ data, rangeHours, setRangeHours, onRefresh, onOpenSightingPhoto, onOpenDispatch }) {
+  const [statusFilter, setStatusFilter] = useState('all'); // 'all' | 'on_site' | 'exited'
+  const [searchText, setSearchText] = useState('');
+
+  const rows = data?.ambulances || [];
+  const summary = data?.summary || { total: 0, on_site: 0, exited: 0, plated: 0, unplated: 0, dispatched: 0 };
+
+  const filtered = useMemo(() => {
+    const q = searchText.trim().toUpperCase();
+    return rows.filter(a => {
+      if (statusFilter !== 'all' && a.status !== statusFilter) return false;
+      if (q) {
+        const plate = (a.plate || 'PLATE NOT READ').toUpperCase();
+        const cams = (a.cameras || []).map(c => (c.name || c.stream || '').toUpperCase()).join(' ');
+        if (!plate.includes(q) && !cams.includes(q)) return false;
+      }
+      return true;
+    });
+  }, [rows, statusFilter, searchText]);
+
+  const buildDispatchPayload = (amb) => {
+    const isOnSite = amb.status === 'on_site';
+    const plateDisp = amb.plate || 'Unplated Ambulance';
+    const entryCam = amb.entry?.device || amb.cameras?.[0]?.name || 'Gate Camera';
+    const entryTimeStr = amb.entry?.at ? tsDate(amb.entry.at) : (amb.first_at ? tsDate(amb.first_at) : '—');
+    const exitTimeStr = isOnSite
+      ? 'Still On Premises (Has not exited yet)'
+      : (amb.exit_confirmed ? `${tsDate(amb.exit?.at || amb.last_at)} (${amb.exit?.device || 'Exit Gate'})` : `${tsDate(amb.exit?.at || amb.last_at)} (Inferred Exit — No Exit Read)`);
+    const dwellStr = amb.source === 'journey' ? dwell(amb.dwell_ms) : (amb.entry ? 'Gate Entry Event' : 'Gate Exit Event');
+    const confStr = amb.confidence ? `${Math.round(amb.confidence * 100)}% (${amb.reads || 1} read${(amb.reads || 1) !== 1 ? 's' : ''})` : `${amb.reads || 1} detection`;
+
+    return {
+      ref_id: amb.id,
+      plate: amb.plate || '',
+      status: amb.status,
+      entry_sighting_id: amb.entry_sighting_id || null,
+      exit_sighting_id: amb.exit_sighting_id || null,
+      photo_url: amb.photo_url || null,
+      plate_url: amb.plate_url || null,
+      subject: `🚑 Medanta Ambulance Alert: ${plateDisp} — ${isOnSite ? 'On Premises' : 'Exited'} (${entryCam})`,
+      title: `Emergency Vehicle Tracking — Ambulance ${isOnSite ? 'Arrival / On Premises' : 'Departure Advisory'}`,
+      summary: isOnSite
+        ? `Ambulance ${plateDisp} entered hospital premises via ${entryCam} at ${entryTimeStr} and is currently on site.`
+        : `Ambulance ${plateDisp} completed gate movement and departed at ${amb.exit?.at ? tsDate(amb.exit.at) : tsDate(amb.last_at)}.`,
+      metadata: {
+        'Vehicle Type': 'Ambulance',
+        'License Plate': amb.plate || 'Plate Not Read',
+        'Current Status': isOnSite ? 'On Premises' : 'Exited',
+        'Arrival / Entry': `${entryTimeStr} (${entryCam})`,
+        'Exit / Last Seen': exitTimeStr,
+        'Dwell Duration': dwellStr,
+        'Detection Confidence': confStr
+      }
+    };
+  };
+
+  return (
+    <div className="card" style={{ marginTop: 16 }}>
+      {/* Header */}
+      <div className="head" style={{ flexWrap: 'wrap', gap: 12, padding: '14px 18px', background: 'linear-gradient(90deg, #fff5f5 0%, #ffffff 60%)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          <div style={{
+            width: 36, height: 36, borderRadius: 10, background: '#fee2e2', border: '1px solid #fecaca',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 18
+          }}>
+            🚑
+          </div>
+          <div>
+            <h3 style={{ margin: 0, fontSize: 16, color: '#7f1d1d', display: 'flex', alignItems: 'center', gap: 8 }}>
+              Ambulance Registry &amp; Email Dispatch
+            </h3>
+            <small style={{ color: '#64748b' }}>
+              All detected ambulances (plated journeys &amp; gate detections) with instant AWS SES dispatch alerts
+            </small>
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <span className="badge" style={{ background: '#fee2e2', color: '#b91c1c', border: '1px solid #fca5a5', fontSize: 10, fontWeight: 800 }}>
+            ● {summary.on_site} On Premises
+          </span>
+          <span className="badge" style={{ background: '#dcfce7', color: '#15803d', border: '1px solid #86efac', fontSize: 10, fontWeight: 800 }}>
+            ✓ {summary.exited} Exited
+          </span>
+          <span className="badge" style={{ background: '#f1f5f9', color: '#334155', fontSize: 10, fontWeight: 700 }}>
+            Total: {summary.total}
+          </span>
+          {summary.dispatched > 0 && (
+            <span className="badge" style={{ background: '#e0f2fe', color: '#0369a1', fontSize: 10, fontWeight: 700 }}>
+              ✉ {summary.dispatched} Dispatched
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Filter Bar */}
+      <div style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10,
+        padding: '10px 18px', background: '#fafbfc', borderBottom: '1px solid #eef2f7', flexWrap: 'wrap'
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', gap: 4 }}>
+            {[
+              { k: '1', label: '1h' },
+              { k: 'today', label: 'Today' },
+              { k: '24', label: '24h' },
+              { k: '168', label: '7 Days' },
+              { k: '720', label: '30 Days' },
+            ].map(r => (
+              <button
+                key={r.k}
+                type="button"
+                className={`vc-range-btn ${String(rangeHours) === r.k ? 'active' : ''}`}
+                onClick={() => setRangeHours(r.k)}
+              >
+                {r.label}
+              </button>
+            ))}
+          </div>
+
+          <select
+            value={statusFilter}
+            onChange={e => setStatusFilter(e.target.value)}
+            style={{ padding: '4px 8px', border: '1px solid #dfe6f0', borderRadius: 6, fontSize: 11, fontWeight: 700, background: '#fff' }}
+          >
+            <option value="all">All Statuses ({rows.length})</option>
+            <option value="on_site">🔴 On Premises ({summary.on_site})</option>
+            <option value="exited">🟢 Exited ({summary.exited})</option>
+          </select>
+
+          <input
+            placeholder="🔍 Search plate or camera…"
+            value={searchText}
+            onChange={e => setSearchText(e.target.value)}
+            style={{ padding: '5px 10px', border: '1px solid #dfe6f0', borderRadius: 6, fontSize: 11, fontWeight: 600, width: 190, background: '#fff' }}
+          />
+        </div>
+
+        <button type="button" className="btn sm" onClick={onRefresh} style={{ fontSize: 11 }}>
+          🔄 Refresh
+        </button>
+      </div>
+
+      {/* Table */}
+      <div style={{ overflowX: 'auto', maxHeight: 420, overflowY: 'auto' }}>
+        <table className="tbl">
+          <thead style={{ position: 'sticky', top: 0, background: '#fff', zIndex: 2 }}>
+            <tr>
+              <th>Ambulance / Plate</th>
+              <th>Entry / Arrival Gate</th>
+              <th>Exit / Current Status</th>
+              <th>Dwell / Flow</th>
+              <th>Reads &amp; Dispatch History</th>
+              <th style={{ textAlign: 'right' }}>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map(amb => {
+              const isOnSite = amb.status === 'on_site';
+              const plateStr = amb.plate || 'PLATE NOT READ';
+              return (
+                <tr key={amb.id}>
+                  <td>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                      <div
+                        className={amb.photo_url ? 'clickable-thumb' : undefined}
+                        onClick={() => amb.photo_url && onOpenSightingPhoto({
+                          photo_url: amb.photo_url,
+                          plate: plateStr,
+                          stream: amb.entry?.stream || amb.exit?.stream || 'ambulance',
+                          ts: amb.last_at || amb.first_at,
+                          confidence: amb.confidence
+                        })}
+                        style={{
+                          width: 44, height: 36, borderRadius: 7, overflow: 'hidden',
+                          border: isOnSite ? '1.5px solid #ef4444' : '1.5px solid #cbd5e1',
+                          background: '#fff5f5', flexShrink: 0, display: 'flex',
+                          alignItems: 'center', justifyContent: 'center'
+                        }}
+                        title={amb.photo_url ? 'Click to view ambulance capture' : 'No snapshot'}
+                      >
+                        {amb.photo_url ? (
+                          <img src={`${API}${amb.photo_url}`} alt={plateStr} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                        ) : (
+                          <span style={{ fontSize: 17 }}>🚑</span>
+                        )}
+                      </div>
+                      <div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                          {amb.plate ? (
+                            <span style={{ fontFamily: 'var(--font-mono, monospace)', fontWeight: 800, fontSize: 12, color: '#0f172a', background: '#f1f5f9', padding: '2px 7px', borderRadius: 5, border: '1px solid #cbd5e1' }}>
+                              {amb.plate}
+                            </span>
+                          ) : (
+                            <span style={{ fontSize: 10, fontWeight: 800, color: '#9a3412', background: '#ffedd5', padding: '2px 7px', borderRadius: 5, border: '1px solid #fdba74' }}>
+                              PLATE NOT READ
+                            </span>
+                          )}
+                          <span style={{
+                            fontSize: 9, fontWeight: 800, padding: '2px 6px', borderRadius: 4,
+                            background: isOnSite ? '#fee2e2' : '#dcfce7',
+                            color: isOnSite ? '#dc2626' : '#15803d',
+                            border: `1px solid ${isOnSite ? '#fca5a5' : '#86efac'}`
+                          }}>
+                            {isOnSite ? '● ON PREMISES' : '✓ EXITED'}
+                          </span>
+                        </div>
+                        <div style={{ fontSize: 10, color: '#64748b', marginTop: 2 }}>
+                          {(amb.cameras || []).map(c => c.name || c.stream).join(' → ') || 'Gate Detection'}
+                        </div>
+                      </div>
+                    </div>
+                  </td>
+
+                  <td style={{ whiteSpace: 'nowrap' }}>
+                    {amb.entry ? (
+                      <div>
+                        <div style={{ fontSize: 11, fontWeight: 700, color: '#166534' }}>{tsDate(amb.entry.at)}</div>
+                        <div style={{ fontSize: 10, color: '#64748b' }}>{amb.entry.device || amb.entry.stream}</div>
+                      </div>
+                    ) : (
+                      <span className="muted" style={{ fontSize: 10 }}>Detected at Exit only</span>
+                    )}
+                  </td>
+
+                  <td style={{ whiteSpace: 'nowrap' }}>
+                    {isOnSite ? (
+                      <div>
+                        <span style={{ fontSize: 11, fontWeight: 800, color: '#ea580c', background: '#fff7ed', padding: '2px 8px', borderRadius: 5, border: '1px solid #fed7aa' }}>
+                          🔴 Still On Premises
+                        </span>
+                        <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 2 }}>Has not exited gate yet</div>
+                      </div>
+                    ) : (
+                      <div>
+                        <div style={{ fontSize: 11, fontWeight: 700, color: '#1d4ed8' }}>{tsDate(amb.exit?.at || amb.last_at)}</div>
+                        <div style={{ fontSize: 10, color: '#64748b' }}>
+                          {amb.exit_confirmed ? (amb.exit?.device || 'Exit Gate') : 'Inferred Exit (No Exit Read)'}
+                        </div>
+                      </div>
+                    )}
+                  </td>
+
+                  <td style={{ whiteSpace: 'nowrap' }}>
+                    {amb.source === 'journey' ? (
+                      <span style={{ padding: '3px 8px', borderRadius: 6, background: '#f1f5f9', color: '#0f172a', fontWeight: 800, fontSize: 11 }}>
+                        {dwell(amb.dwell_ms)}
+                      </span>
+                    ) : (
+                      <span style={{ padding: '3px 8px', borderRadius: 6, background: '#fff7ed', color: '#9a3412', fontWeight: 700, fontSize: 10 }}>
+                        {amb.direction === 'incoming' ? 'Gate Entry' : 'Gate Exit'}
+                      </span>
+                    )}
+                  </td>
+
+                  <td>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: '#334155' }}>
+                      {amb.reads || 1} read{(amb.reads || 1) !== 1 ? 's' : ''}
+                      {amb.confidence > 0 && ` • ${Math.round(amb.confidence * 100)}%`}
+                    </div>
+                    {amb.last_dispatch ? (
+                      <div
+                        style={{
+                          display: 'inline-flex', alignItems: 'center', gap: 4, marginTop: 3,
+                          padding: '1px 6px', borderRadius: 4, background: '#dcfce7', color: '#166534',
+                          border: '1px solid #86efac', fontSize: 9, fontWeight: 800
+                        }}
+                        title={`Last emailed to ${amb.last_dispatch.recipients} at ${tsDate(amb.last_dispatch.ts)}`}
+                      >
+                        ✓ Emailed • {ts(amb.last_dispatch.ts)}
+                      </div>
+                    ) : (
+                      <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 2 }}>No alert email sent yet</div>
+                    )}
+                  </td>
+
+                  <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                    <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                      {amb.photo_url && (
+                        <button
+                          type="button"
+                          className="btn sm"
+                          onClick={() => onOpenSightingPhoto({
+                            photo_url: amb.photo_url,
+                            plate: plateStr,
+                            stream: amb.entry?.stream || amb.exit?.stream || 'ambulance',
+                            ts: amb.last_at || amb.first_at,
+                            confidence: amb.confidence
+                          })}
+                          style={{ fontSize: 11, padding: '4px 9px' }}
+                          title="Inspect captured ambulance snapshot"
+                        >
+                          📷 Photo
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => onOpenDispatch(buildDispatchPayload(amb))}
+                        style={{
+                          padding: '4px 11px', borderRadius: 6, backgroundColor: '#fff7ed',
+                          border: '1px solid #fdba74', fontSize: 11, cursor: 'pointer',
+                          color: '#c2410c', fontWeight: 800, display: 'inline-flex',
+                          alignItems: 'center', gap: 4
+                        }}
+                        title="Dispatch AWS SES email alert for this ambulance"
+                      >
+                        ✉ Dispatch Email
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
+            {filtered.length === 0 && (
+              <tr>
+                <td colSpan={6} className="empty">
+                  No ambulances detected in this selected time window.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 /* ── Journey Rules Panel ──────────────────────────────────── */
 
 function RulesPanel({ rules, onUpdate }) {
@@ -1779,6 +2649,7 @@ function exportJourneysToExcel({ journeys, apiOrigin }) {
   const tableHeaders = [
     'S.No',
     'License Plate',
+    'Vehicle Type',
     'Status',
     'Entry Camera',
     'Entry Date & Time',
@@ -1801,6 +2672,7 @@ function exportJourneysToExcel({ journeys, apiOrigin }) {
     return [
       idx + 1,
       j.plate,
+      String(j.vehicle_type || 'car').toUpperCase(),
       j.status === 'on_site' ? 'ON SITE' : 'EXITED',
       j.entry?.device || '—',
       entryTime,
@@ -1819,6 +2691,7 @@ function exportJourneysToExcel({ journeys, apiOrigin }) {
   ws['!cols'] = [
     { wch: 6 },  // S.No
     { wch: 16 }, // License Plate
+    { wch: 14 }, // Vehicle Type
     { wch: 12 }, // Status
     { wch: 26 }, // Entry Camera
     { wch: 22 }, // Entry Date & Time
@@ -1887,6 +2760,7 @@ function App() {
   });
   const [selectedCameraFilter, setSelectedCameraFilter] = useState('all');
   const [selectedStatusFilter, setSelectedStatusFilter] = useState('all');
+  const [selectedTypeFilter, setSelectedTypeFilter] = useState('all');
   const [pageSize, setPageSize] = useState(25);
   const [currentPage, setCurrentPage] = useState(1);
   const [exportNotice, setExportNotice] = useState(null);
@@ -1914,6 +2788,9 @@ function App() {
   });
   const [vcCustomEnd, setVcCustomEnd] = useState(() => new Date().toISOString().slice(0, 16));
   const [historyModalOpen, setHistoryModalOpen] = useState(false);
+  const [ambulanceData, setAmbulanceData] = useState(null);
+  const [ambHours, setAmbHours] = useState('24');
+  const [dispatchAmbulance, setDispatchAmbulance] = useState(null);
 
   const devices = state?.devices || [];
   const rules = state?.rules;
@@ -2006,22 +2883,25 @@ function App() {
         const tMs = new Date(vcCustomEnd).getTime() || Date.now();
         vcQuery = `from_ts=${fMs}&to_ts=${tMs}`;
       }
-      const [stateData, analyticsData, journeyRes, vcRes] = await Promise.all([
+      const ambHoursParam = ambHours === 'today' ? 'today' : ambHours;
+      const [stateData, analyticsData, journeyRes, vcRes, ambRes] = await Promise.all([
         api('/state'),
         api('/analytics?hours=' + queryHours),
         api('/journeys?hours=' + queryHours + (searchPlate ? '&plate=' + searchPlate : '')),
-        api('/vehicle-counts?' + vcQuery).catch(() => null)
+        api('/vehicle-counts?' + vcQuery).catch(() => null),
+        api('/ambulances?hours=' + ambHoursParam).catch(() => null)
       ]);
       if (stateData?.feed_mode) setFeedSource(stateData.feed_mode);
       setState(stateData);
       setAnalytics(analyticsData);
       setJourneyData(journeyRes.journeys || []);
       if (vcRes) setVehicleCounts(vcRes);
+      if (ambRes) setAmbulanceData(ambRes);
       setError(null);
     } catch (err) {
       setError(err.message);
     }
-  }, [timeFilter, customStart, searchPlate, vcRange, vcCustomStart, vcCustomEnd]);
+  }, [timeFilter, customStart, searchPlate, vcRange, vcCustomStart, vcCustomEnd, ambHours]);
 
   const handleToggleFeedSource = async () => {
     const nextMode = feedSource === 'demo' ? 'live' : 'demo';
@@ -2073,6 +2953,12 @@ function App() {
         return false;
       }
 
+      // Vehicle type filter
+      const jType = String(j.vehicle_type || 'car').toLowerCase();
+      if (selectedTypeFilter !== 'all' && jType !== selectedTypeFilter) {
+        return false;
+      }
+
       // Camera filter
       if (selectedCameraFilter === 'role_entry') {
         const matches = (j.entry?.role === 'entry') || (j.cameras || []).some(c => c.role === 'entry');
@@ -2097,7 +2983,7 @@ function App() {
 
       return true;
     });
-  }, [journeyData, timeFilter, customStart, customEnd, selectedStatusFilter, selectedCameraFilter, searchPlate]);
+  }, [journeyData, timeFilter, customStart, customEnd, selectedStatusFilter, selectedTypeFilter, selectedCameraFilter, searchPlate]);
 
   // Download ONLY the filtered list in front of the user
   const handleExportExcel = () => {
@@ -2126,6 +3012,7 @@ function App() {
   const handleClearFilters = () => {
     setSelectedCameraFilter('all');
     setSelectedStatusFilter('all');
+    setSelectedTypeFilter('all');
     setSearchPlate('');
     setTimeFilter('1h');
   };
@@ -2133,7 +3020,7 @@ function App() {
   // Reset page when filters change
   useEffect(() => {
     setCurrentPage(1);
-  }, [selectedCameraFilter, selectedStatusFilter, searchPlate, timeFilter, pageSize]);
+  }, [selectedCameraFilter, selectedStatusFilter, selectedTypeFilter, searchPlate, timeFilter, pageSize]);
 
   // Pagination calculation
   const totalPages = Math.max(1, Math.ceil(filteredJourneys.length / pageSize));
@@ -2430,6 +3317,21 @@ function App() {
                 </select>
               </div>
 
+              {/* Vehicle Type Filter */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <span style={{ fontSize: 10, fontWeight: 700, color: '#8ca0bc', textTransform: 'uppercase' }}>🚘 Vehicle Type:</span>
+                <select
+                  value={selectedTypeFilter}
+                  onChange={e => setSelectedTypeFilter(e.target.value)}
+                  style={{ padding: '6px 10px', border: '1px solid #dfe6f0', borderRadius: 7, fontSize: 11, fontWeight: 700, background: '#fff' }}
+                >
+                  <option value="all">All Vehicle Types</option>
+                  {VEHICLE_TYPE_META.map(vt => (
+                    <option key={vt.key} value={vt.key}>{vt.icon} {vt.singular}</option>
+                  ))}
+                </select>
+              </div>
+
               {/* Plate Search */}
               <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                 <input
@@ -2441,7 +3343,7 @@ function App() {
               </div>
 
               {/* Reset Filters button */}
-              {(selectedCameraFilter !== 'all' || selectedStatusFilter !== 'all' || searchPlate || timeFilter !== '1h') && (
+              {(selectedCameraFilter !== 'all' || selectedStatusFilter !== 'all' || selectedTypeFilter !== 'all' || searchPlate || timeFilter !== '1h') && (
                 <button
                   className="btn sm"
                   onClick={handleClearFilters}
@@ -2540,6 +3442,7 @@ function App() {
                 <thead style={{ position: 'sticky', top: 0, background: '#fff', zIndex: 2 }}>
                   <tr>
                     <th>Plate</th>
+                    <th>Vehicle Type</th>
                     <th>Status</th>
                     <th>Entry Camera</th>
                     <th>Entry Time</th>
@@ -2551,17 +3454,20 @@ function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {paginatedJourneys.map((j, i) => (
-                    <JourneyFlow
-                      key={j.plate + j.first_at}
-                      journey={j}
-                      expanded={expandedJourney === i}
-                      onToggle={() => setExpandedJourney(expandedJourney === i ? null : i)}
-                      onOpenSightingPhoto={(info) => setSelectedSightingModal(info)}
-                    />
-                  ))}
+                  {paginatedJourneys.map((j, i) => {
+                    const jKey = `${j.plate || ''}_${j.first_at || i}`;
+                    return (
+                      <JourneyFlow
+                        key={jKey}
+                        journey={j}
+                        expanded={expandedJourney === jKey}
+                        onToggle={() => setExpandedJourney(prev => (prev === jKey ? null : jKey))}
+                        onOpenSightingPhoto={(info) => setSelectedSightingModal(info)}
+                      />
+                    );
+                  })}
                   {filteredJourneys.length === 0 && (
-                    <tr><td colSpan={9} className="empty">No vehicle journeys match the selected criteria</td></tr>
+                    <tr><td colSpan={10} className="empty">No vehicle journeys match the selected criteria</td></tr>
                   )}
                 </tbody>
               </table>
@@ -2700,7 +3606,22 @@ function App() {
         </div>
       </div>
 
+      {/* ── Bottom Full-Width Ambulance Registry & Email Dispatch ── */}
+      <AmbulanceRegistryCard
+        data={ambulanceData}
+        rangeHours={ambHours}
+        setRangeHours={setAmbHours}
+        onRefresh={loadState}
+        onOpenSightingPhoto={(info) => setSelectedSightingModal(info)}
+        onOpenDispatch={(payload) => setDispatchAmbulance(payload)}
+      />
+
       {/* ── Lightbox & Modals ── */}
+      <AmbulanceEmailDispatchModal
+        alertData={dispatchAmbulance}
+        onClose={() => setDispatchAmbulance(null)}
+        onDispatched={() => loadState()}
+      />
       <VehicleHistoryModal
         open={historyModalOpen}
         onClose={() => setHistoryModalOpen(false)}
