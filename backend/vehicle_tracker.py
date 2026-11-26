@@ -141,6 +141,32 @@ IST_OFFSET_MS = int(5.5 * 3600 * 1000)
 def to_ist_strftime(epoch_sec=None, fmt='%Y-%m-%d %H:%M:%S'):
     sec = epoch_sec if epoch_sec is not None else time.time()
     return time.strftime(fmt, time.gmtime(sec + IST_OFFSET_SEC))
+
+def _parse_window_bounds(query, default_hours='24', allow_all=False):
+    now_ms = int(time.time() * 1000)
+    from_q = query.get('from_ts', [None])[0]
+    to_q = query.get('to_ts', [None])[0]
+    hours_q = query.get('hours', [default_hours])[0]
+    if from_q is not None:
+        from_ts = max(0, int(float(from_q)))
+        to_ts = int(float(to_q)) if to_q is not None else now_ms
+        has_to = to_q is not None
+    elif allow_all and str(hours_q).lower() in ('all', '0'):
+        from_ts = 0
+        to_ts = now_ms
+        has_to = False
+    elif str(hours_q).lower() == 'today':
+        now_sec = int(time.time())
+        seconds_today_in_ist = (now_sec + IST_OFFSET_SEC) % 86400
+        from_ts = (now_sec - seconds_today_in_ist) * 1000
+        to_ts = now_ms
+        has_to = False
+    else:
+        hours_val = min(720.0, max(0.25, float(hours_q)))
+        from_ts = int(now_ms - hours_val * 3600000)
+        to_ts = now_ms
+        has_to = False
+    return from_ts, to_ts, has_to
 STREAM_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]{0,40}$')
 ROLES = ('entry', 'exit', 'basement_entry', 'basement_exit', 'basement', 'porch', 'emergency', 'checkpoint')
 GATE_DIRECTIONS = ('incoming', 'outgoing', 'basement_incoming', 'basement_outgoing')
@@ -3005,21 +3031,25 @@ class Handler(BaseHTTPRequestHandler):
             if path_str == '/rules':
                 return self.send_json(200, self.store.rules())
             if path_str == '/journeys':
-                hours = min(720, max(1, float(query.get('hours', ['24'])[0])))
+                since_ms, to_ms, has_to = _parse_window_bounds(query, default_hours='24', allow_all=False)
                 plate = query.get('plate', [None])[0]
                 vtype_filter = (query.get('type', [None])[0] or query.get('vehicle_type', [None])[0] or '').strip().lower()
-                result = journeys(self.store, int(time.time() * 1000 - hours * 3600000), plate)
+                result = journeys(self.store, since_ms, plate)
+                if has_to:
+                    result = [v for v in result if v['first_at'] <= to_ms]
                 if vtype_filter and vtype_filter != 'all':
                     norm_vt = normalize_vehicle_type(vtype_filter)
                     result = [v for v in result if normalize_vehicle_type(v.get('vehicle_type')) == norm_vt]
                 return self.send_json(200, {'journeys': result, 'count': len(result)})
             if path_str in ('/journeys.csv', '/journeys/export'):
-                hours = min(720, max(1, float(query.get('hours', ['24'])[0])))
+                since_ms, to_ms, has_to = _parse_window_bounds(query, default_hours='24', allow_all=False)
                 plate = query.get('plate', [None])[0]
                 status_filter = query.get('status', [None])[0]
                 camera_filter = query.get('camera', [None])[0]
                 vtype_filter = (query.get('type', [None])[0] or query.get('vehicle_type', [None])[0] or '').strip().lower()
-                result = journeys(self.store, int(time.time() * 1000 - hours * 3600000), plate)
+                result = journeys(self.store, since_ms, plate)
+                if has_to:
+                    result = [v for v in result if v['first_at'] <= to_ms]
                 if status_filter:
                     result = [v for v in result if v['status'] == status_filter]
                 if vtype_filter and vtype_filter != 'all':
@@ -3077,29 +3107,11 @@ class Handler(BaseHTTPRequestHandler):
                 limit_q = min(500, max(10, int(query.get('limit', ['200'])[0])))
                 return self.send_json(200, build_ambulance_list(self.store, hours=hrs, limit=limit_q))
             if path_str == '/vehicle-counts':
-                now_ms = int(time.time() * 1000)
-                from_q = query.get('from_ts', [None])[0]
-                to_q = query.get('to_ts', [None])[0]
-                hours_q = query.get('hours', ['24'])[0]
                 granularity = query.get('granularity', ['auto'])[0]
                 direction_q = query.get('direction', [None])[0]
                 vtype_q = query.get('type', [None])[0]
                 limit_q = min(20000, max(10, int(query.get('limit', ['60'])[0])))
-                if from_q is not None:
-                    from_ts = max(0, int(float(from_q)))
-                    to_ts = int(float(to_q)) if to_q is not None else now_ms
-                elif str(hours_q).lower() in ('all', '0'):
-                    from_ts = 0
-                    to_ts = now_ms
-                elif str(hours_q).lower() == 'today':
-                    now_sec = int(time.time())
-                    seconds_today_in_ist = (now_sec + IST_OFFSET_SEC) % 86400
-                    from_ts = (now_sec - seconds_today_in_ist) * 1000
-                    to_ts = now_ms
-                else:
-                    hours_val = max(0.25, float(hours_q))
-                    from_ts = int(now_ms - hours_val * 3600000)
-                    to_ts = now_ms
+                from_ts, to_ts, _ = _parse_window_bounds(query, default_hours='24', allow_all=True)
                 summary = self.store.vehicle_counts_summary(
                     from_ts=from_ts, to_ts=to_ts, granularity=granularity,
                     event_limit=limit_q, direction=direction_q, vehicle_type=vtype_q
@@ -3107,25 +3119,9 @@ class Handler(BaseHTTPRequestHandler):
                 summary['remaining_cameras_live'] = self.engine.remaining_cameras_live()
                 return self.send_json(200, summary)
             if path_str in ('/vehicle-counts.csv', '/vehicle-counts/export'):
-                now_ms = int(time.time() * 1000)
-                from_q = query.get('from_ts', [None])[0]
-                to_q = query.get('to_ts', [None])[0]
-                hours_q = query.get('hours', ['all'])[0]
                 direction = query.get('direction', [None])[0]
                 vtype_q = query.get('type', [None])[0]
-                if from_q is not None:
-                    from_ts = max(0, int(float(from_q)))
-                    to_ts = int(float(to_q)) if to_q is not None else now_ms
-                elif str(hours_q).lower() in ('all', '0'):
-                    from_ts = 0
-                    to_ts = now_ms
-                elif str(hours_q).lower() == 'today':
-                    now_sec = int(time.time())
-                    from_ts = (now_sec - (now_sec + IST_OFFSET_SEC) % 86400) * 1000
-                    to_ts = now_ms
-                else:
-                    from_ts = int(now_ms - max(0.25, float(hours_q)) * 3600000)
-                    to_ts = now_ms
+                from_ts, to_ts, _ = _parse_window_bounds(query, default_hours='all', allow_all=True)
                 events = self.store.vehicle_counts_events(from_ts=from_ts, to_ts=to_ts, direction=direction, vehicle_type=vtype_q, limit=10000)
                 import csv, io
                 out = io.StringIO()
@@ -3152,9 +3148,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return self.wfile.write(payload)
             if path_str == '/analytics':
-                hours = min(720, max(1, float(query.get('hours', ['24'])[0])))
-                since = int(time.time() * 1000 - hours * 3600000)
+                since, to_ms, has_to = _parse_window_bounds(query, default_hours='24', allow_all=False)
                 visits = journeys(self.store, since)
+                if has_to:
+                    visits = [v for v in visits if v['first_at'] <= to_ms]
                 # Compute today's start in IST timezone
                 now_sec = int(time.time())
                 seconds_today_in_ist = (now_sec + IST_OFFSET_SEC) % 86400

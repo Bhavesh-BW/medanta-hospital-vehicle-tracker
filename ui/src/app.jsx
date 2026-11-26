@@ -951,7 +951,7 @@ function GateAnalyticsCard({ analytics, devices, timeFilter, setTimeFilter, load
   const totalExited = analytics?.exited ?? (totalEntries > onSiteCount ? totalEntries - onSiteCount : cameraExits);
   const inferredExits = Math.max(0, totalExited - cameraExits);
   const totalInternal = internalDevices.reduce((sum, d) => sum + (perCamera[d.stream] || 0), 0);
-  const clearanceRate = totalEntries > 0 ? Math.round((totalExited / totalEntries) * 100) : 0;
+  const clearanceRate = totalEntries > 0 ? Math.min(100, Math.round((totalExited / totalEntries) * 100)) : 0;
 
   return (
     <div className="card">
@@ -3115,20 +3115,24 @@ function App() {
     const reqId = ++jtReqRef.current;
     if (showLoader) setJtLoading(true);
     try {
-      let queryHours = 24;
-      if (timeFilter === '15m' || timeFilter === '30m' || timeFilter === '1h') queryHours = 2;
-      else if (timeFilter === '2h') queryHours = 4;
-      else if (timeFilter === '6h') queryHours = 8;
-      else if (timeFilter === '12h') queryHours = 16;
-      else if (timeFilter === '24h' || timeFilter === 'today') queryHours = 24;
-      else if (timeFilter === '7d') queryHours = 168;
+      let jtWindowQs = 'hours=24';
+      if (timeFilter === '15m') jtWindowQs = 'hours=0.25';
+      else if (timeFilter === '30m') jtWindowQs = 'hours=0.5';
+      else if (timeFilter === '1h') jtWindowQs = 'hours=1';
+      else if (timeFilter === '2h') jtWindowQs = 'hours=2';
+      else if (timeFilter === '6h') jtWindowQs = 'hours=6';
+      else if (timeFilter === '12h') jtWindowQs = 'hours=12';
+      else if (timeFilter === '24h') jtWindowQs = 'hours=24';
+      else if (timeFilter === 'today') jtWindowQs = 'hours=today';
+      else if (timeFilter === '7d') jtWindowQs = 'hours=168';
       else if (timeFilter === 'custom') {
-        const diffMs = Math.max(0, Date.now() - new Date(customStart).getTime());
-        queryHours = Math.min(720, Math.max(1, Math.ceil(diffMs / 3600000)));
+        const fMs = new Date(customStart).getTime() || 0;
+        const tMs = new Date(customEnd).getTime() || Date.now();
+        jtWindowQs = `from_ts=${fMs}&to_ts=${tMs}`;
       }
       const [analyticsData, journeyRes] = await Promise.all([
-        api('/analytics?hours=' + queryHours),
-        api('/journeys?hours=' + queryHours + (searchPlate ? '&plate=' + encodeURIComponent(searchPlate) : ''))
+        api('/analytics?' + jtWindowQs),
+        api('/journeys?' + jtWindowQs + (searchPlate ? '&plate=' + encodeURIComponent(searchPlate) : ''))
       ]);
       if (reqId === jtReqRef.current) {
         setAnalytics(analyticsData);
@@ -3140,7 +3144,7 @@ function App() {
     } finally {
       if (reqId === jtReqRef.current) setJtLoading(false);
     }
-  }, [timeFilter, customStart, searchPlate]);
+  }, [timeFilter, customStart, customEnd, searchPlate]);
 
   const fetchVehicleCounts = useCallback(async (showLoader = false) => {
     const reqId = ++vcReqRef.current;
