@@ -2994,6 +2994,8 @@ function App() {
   const [feedSource, setFeedSource] = useState(null);
   const [state, setState] = useState(null);
   const [analytics, setAnalytics] = useState(null);
+  const [todayAnalytics, setTodayAnalytics] = useState(null);
+  const [todayVehicleCounts, setTodayVehicleCounts] = useState(null);
   const [journeyData, setJourneyData] = useState([]);
   const [expandedJourney, setExpandedJourney] = useState(null);
   const [addOpen, setAddOpen] = useState(false);
@@ -3196,6 +3198,17 @@ function App() {
     }
   }, [ambHours]);
 
+  const fetchTodayKpis = useCallback(async () => {
+    try {
+      const [todayAn, todayVc] = await Promise.all([
+        api('/analytics?hours=today').catch(() => null),
+        api('/vehicle-counts?hours=today').catch(() => null),
+      ]);
+      if (todayAn) setTodayAnalytics(todayAn);
+      if (todayVc) setTodayVehicleCounts(todayVc);
+    } catch { }
+  }, []);
+
   const pollAll = useCallback(async (showLoaders = false, forceAll = false) => {
     try {
       const isBgTick = !showLoaders && !forceAll;
@@ -3205,7 +3218,7 @@ function App() {
       const isVcHeavy = (vcRange === '7d' || vcRange === 'all' || vcRange === 'custom');
       const isAmbHeavy = (String(ambHours) === '168');
 
-      const tasks = [api('/state')];
+      const tasks = [api('/state'), fetchTodayKpis()];
       if (!isBgTick || !isJtHeavy || (tick % 8 === 0)) tasks.push(fetchTrafficAndJourneys(showLoaders));
       if (!isBgTick || !isVcHeavy || (tick % 8 === 0)) tasks.push(fetchVehicleCounts(showLoaders));
       if (!isBgTick || !isAmbHeavy || (tick % 8 === 0)) tasks.push(fetchAmbulances(showLoaders));
@@ -3217,7 +3230,7 @@ function App() {
     } catch (err) {
       setError(err.message);
     }
-  }, [fetchTrafficAndJourneys, fetchVehicleCounts, fetchAmbulances, timeFilter, vcRange, ambHours]);
+  }, [fetchTodayKpis, fetchTrafficAndJourneys, fetchVehicleCounts, fetchAmbulances, timeFilter, vcRange, ambHours]);
 
   const loadState = useCallback(() => pollAll(false, true), [pollAll]);
 
@@ -3452,13 +3465,13 @@ function App() {
       {error && <div className="notice err">⚠ Connection error: {error}</div>}
       {engine?.model_error && <div className="notice err">⚠ Model error: {engine.model_error}</div>}
 
-      {/* ── KPI Cards ── */}
+      {/* ── KPI Cards (Always locked to Today's IST data regardless of section filters) ── */}
       <div className="kpis">
-        <KpiCard label="VEHICLES TODAY" value={analytics?.vehicles_today ?? '—'} sub="Unique plate entries" color="var(--teal)" />
-        <KpiCard label="ON SITE NOW" value={analytics?.on_site ?? '—'} sub="Currently in premises" color="var(--blue)" />
-        <BasementInKpiCard vehicleCounts={vehicleCounts} loading={vcLoading} />
-        <KpiCard label="UNIQUE PLATES" value={analytics?.unique_plates ?? '—'} sub={analytics?.hours ? `In last ${analytics.hours}h window` : 'In selected window'} color="var(--purple)" />
-        <KpiCard label="AVG DWELL TIME" value={analytics?.avg_dwell_ms ? dwell(analytics.avg_dwell_ms) : '—'} sub="Entry to exit average" color="var(--gold)" />
+        <KpiCard label="VEHICLES TODAY" value={todayAnalytics?.vehicles_today ?? '—'} sub="Today's unique entries" color="var(--teal)" />
+        <KpiCard label="ON SITE NOW" value={todayAnalytics?.on_site ?? '—'} sub="Currently in premises" color="var(--blue)" />
+        <BasementInKpiCard vehicleCounts={todayVehicleCounts} loading={!todayVehicleCounts} />
+        <KpiCard label="UNIQUE PLATES" value={todayAnalytics?.unique_plates ?? '—'} sub="Today's unique plates" color="var(--purple)" />
+        <KpiCard label="AVG DWELL TIME" value={todayAnalytics?.avg_dwell_ms ? dwell(todayAnalytics.avg_dwell_ms) : '—'} sub="Today's entry to exit" color="var(--gold)" />
       </div>
 
       {/* ── Live Camera Grid Card with Dynamic Add/Remove & Auto-Enlarge ── */}
