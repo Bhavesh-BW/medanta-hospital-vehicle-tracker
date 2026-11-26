@@ -142,7 +142,15 @@ def to_ist_strftime(epoch_sec=None, fmt='%Y-%m-%d %H:%M:%S'):
     sec = epoch_sec if epoch_sec is not None else time.time()
     return time.strftime(fmt, time.gmtime(sec + IST_OFFSET_SEC))
 STREAM_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]{0,40}$')
-ROLES = ('entry', 'exit', 'checkpoint')
+ROLES = ('entry', 'exit', 'basement_entry', 'basement_exit', 'basement', 'porch', 'emergency', 'checkpoint')
+GATE_DIRECTIONS = ('incoming', 'outgoing', 'basement_incoming', 'basement_outgoing')
+COUNTABLE_ROLE_DIRECTION = {
+    'entry': 'incoming',
+    'exit': 'outgoing',
+    'basement_entry': 'basement_incoming',
+    'basement': 'basement_incoming',
+    'basement_exit': 'basement_outgoing',
+}
 MIME_TYPES = {
     '.html': 'text/html; charset=utf-8',
     '.js': 'application/javascript; charset=utf-8',
@@ -1089,7 +1097,7 @@ class Store:
         if not STREAM_RE.match(stream):
             raise ValueError('Invalid camera stream name')
         if role not in ROLES:
-            raise ValueError('Role must be entry, exit or checkpoint')
+            raise ValueError(f"Role must be one of {', '.join(ROLES)}")
         name = str(name or stream).strip()[:80] or stream
         masks_json = json.dumps(masks or [])
         clean_group = normalize_gate_group(gate_group, display=True)
@@ -1241,8 +1249,8 @@ class Store:
         return re.sub(r'[^A-Z0-9]', '', str(plate or '').upper())
 
     def record_vehicle_count(self, stream, direction, vehicle_type, plate, track_id, confidence, ts, dedup_gap_ms=1800000, gate_group='', gate_dedup_ms=15000, coactive_plates=None):
-        """Persist an incoming or outgoing vehicle event with same-gate fuzzy OCR + 1-to-1 cross-camera dedup."""
-        if direction not in ('incoming', 'outgoing'):
+        """Persist an incoming, outgoing, or basement gate vehicle event with same-gate fuzzy OCR + 1-to-1 dedup."""
+        if direction not in GATE_DIRECTIONS:
             return None, False
         vtype = normalize_vehicle_type(vehicle_type)
         clean_plate = plate.upper() if plate else None
@@ -1393,8 +1401,20 @@ class Store:
     @staticmethod
     def _empty_vtype_bucket():
         return {'car': 0, 'bike': 0, 'auto': 0, 'ambulance': 0, 'total': 0}
+
+    @staticmethod
+    def _append_direction_filter(sql, params, direction):
+        if direction == 'main':
+            sql += " AND direction IN ('incoming','outgoing')"
+        elif direction == 'basement':
+            sql += " AND direction IN ('basement_incoming','basement_outgoing')"
+        elif direction in GATE_DIRECTIONS:
+            sql += ' AND direction=?'
+            params.append(direction)
+        return sql
+
     def vehicle_counts_summary(self, from_ts=0, to_ts=None, granularity='hourly', event_limit=50, direction=None, vehicle_type=None):
-        """Query persisted historical incoming/outgoing vehicle counts from vehicle_counts table."""
+        """Query persisted historical incoming/outgoing and basement vehicle counts from vehicle_counts table."""
         end_ts = int(to_ts) if to_ts is not None else int(time.time() * 1000)
         start_ts = max(0, int(from_ts or 0))
         devices = {d['stream']: d for d in self.devices()}
@@ -1403,9 +1423,7 @@ class Store:
             "FROM vehicle_counts WHERE ts>=? AND ts<=?"
         )
         ev_params = [start_ts, end_ts]
-        if direction in ('incoming', 'outgoing'):
-            ev_sql += ' AND direction=?'
-            ev_params.append(direction)
+        ev_sql = self._append_direction_filter(ev_sql, ev_params, direction)
         if vehicle_type in VEHICLE_TYPES:
             ev_sql += ' AND vehicle_type=?'
             ev_params.append(vehicle_type)
@@ -1431,33 +1449,36 @@ class Store:
             ).fetchall()
             bounds = self.db.execute('SELECT MIN(ts), MAX(ts) FROM vehicle_counts').fetchone()
 
-        incoming = self._empty_vtype_bucket()
-        outgoing = self._empty_vtype_bucket()
-        for direction, vtype, cnt in agg_rows:
-            vt = normalize_vehicle_type(vtype)
-            target = incoming if direction == 'incoming' else outgoing
-            target[vt] += int(cnt)
-            target['total'] += int(cnt)
+        agg_buckets = {d: self._empty_vtype_bucket() for d in GATE_DIRECTIONS}
+        for dir_key, vtype, cnt in agg_rows:
+            if dir_key in agg_buckets:
+                vt = normalize_vehicle_type(vtype)
+                agg_buckets[dir_key][vt] += int(cnt)
+                agg_buckets[dir_key]['total'] += int(cnt)
 
-        all_in = self._empty_vtype_bucket()
-        all_out = self._empty_vtype_bucket()
-        for direction, vtype, cnt in all_rows:
-            vt = normalize_vehicle_type(vtype)
-            target = all_in if direction == 'incoming' else all_out
-            target[vt] += int(cnt)
-            target['total'] += int(cnt)
+        all_buckets = {d: self._empty_vtype_bucket() for d in GATE_DIRECTIONS}
+        for dir_key, vtype, cnt in all_rows:
+            if dir_key in all_buckets:
+                vt = normalize_vehicle_type(vtype)
+                all_buckets[dir_key][vt] += int(cnt)
+                all_buckets[dir_key]['total'] += int(cnt)
+
+        incoming = agg_buckets['incoming']
+        outgoing = agg_buckets['outgoing']
+        all_in = all_buckets['incoming']
+        all_out = all_buckets['outgoing']
 
         cam_map = {}
-        for stream, direction, vtype, cnt in cam_rows:
+        for stream, dir_key, vtype, cnt in cam_rows:
             vt = normalize_vehicle_type(vtype)
-            key = (stream, direction)
+            key = (stream, dir_key)
             if key not in cam_map:
                 dev = devices.get(stream, {})
                 cam_map[key] = {
                     'stream': stream,
                     'name': dev.get('name', stream),
-                    'role': dev.get('role', direction),
-                    'direction': direction,
+                    'role': dev.get('role', dir_key),
+                    'direction': dir_key,
                     'gate_group': dev.get('gate_group', ''),
                     **self._empty_vtype_bucket()
                 }
@@ -1470,15 +1491,23 @@ class Store:
             is_daily = (start_ts > 0 and (end_ts - start_ts) > 48 * 3600000) or (start_ts == 0)
         bucket_ms = 86400000 if is_daily else 3600000
         hist_buckets = {}
-        for direction, vtype, ts_val in raw_hist:
+        basement_hist_buckets = {}
+        for dir_key, vtype, ts_val in raw_hist:
+            if dir_key in ('incoming', 'outgoing'):
+                target_map, side_key = hist_buckets, dir_key
+            elif dir_key in ('basement_incoming', 'basement_outgoing'):
+                target_map = basement_hist_buckets
+                side_key = 'incoming' if dir_key == 'basement_incoming' else 'outgoing'
+            else:
+                continue
             vt = normalize_vehicle_type(vtype)
             b_ts = (int(ts_val) + IST_OFFSET_MS) // bucket_ms * bucket_ms - IST_OFFSET_MS
-            slot = hist_buckets.setdefault(b_ts, {
+            slot = target_map.setdefault(b_ts, {
                 'bucket': b_ts,
                 'incoming': self._empty_vtype_bucket(),
                 'outgoing': self._empty_vtype_bucket()
             })
-            side = slot['incoming'] if direction == 'incoming' else slot['outgoing']
+            side = slot[side_key]
             side[vt] += 1
             side['total'] += 1
 
@@ -1505,6 +1534,15 @@ class Store:
             'window': {'from_ts': start_ts, 'to_ts': end_ts, 'granularity': 'daily' if is_daily else 'hourly'},
             'incoming': incoming,
             'outgoing': outgoing,
+            'basement': {
+                'incoming': agg_buckets['basement_incoming'],
+                'outgoing': agg_buckets['basement_outgoing'],
+                'history': [basement_hist_buckets[k] for k in sorted(basement_hist_buckets.keys())],
+                'all_time': {
+                    'incoming': all_buckets['basement_incoming'],
+                    'outgoing': all_buckets['basement_outgoing'],
+                }
+            },
             'by_camera': sorted(cam_map.values(), key=lambda x: (x['direction'], -x['total'])),
             'history': [hist_buckets[k] for k in sorted(hist_buckets.keys())],
             'recent_events': recent_events,
@@ -1521,9 +1559,7 @@ class Store:
         devices = {d['stream']: d for d in self.devices()}
         sql = "SELECT id, stream, direction, vehicle_type, plate, confidence, ts, COALESCE(gate_group,''), COALESCE(merged_streams,'') FROM vehicle_counts WHERE ts>=? AND ts<=?"
         params = [start_ts, end_ts]
-        if direction in ('incoming', 'outgoing'):
-            sql += ' AND direction=?'
-            params.append(direction)
+        sql = self._append_direction_filter(sql, params, direction)
         if vehicle_type in VEHICLE_TYPES:
             sql += ' AND vehicle_type=?'
             params.append(vehicle_type)
@@ -1752,7 +1788,7 @@ def build_ambulance_list(store, hours=24, limit=200):
                         break
         if covered:
             continue
-        is_in = (ev.get('direction') == 'incoming')
+        is_in = (ev.get('direction') in ('incoming', 'basement_incoming'))
         cam_node = {
             'stream': ev['stream'],
             'name': ev.get('camera') or ev['stream'],
@@ -2438,7 +2474,7 @@ class Engine:
                 in_frame[vt] += 1
                 in_frame['total'] += 1
 
-        direction = 'incoming' if (count_enabled and role == 'entry') else ('outgoing' if (count_enabled and role == 'exit') else None)
+        direction = COUNTABLE_ROLE_DIRECTION.get(role) if count_enabled else None
         db_ops = []
 
         # Collect coactive confirmed plates to protect distinct adjacent fleet vehicles
@@ -2447,7 +2483,7 @@ class Engine:
             if tr.get('plate') and tr.get('misses', 0) == 0
         }
 
-        if direction in ('incoming', 'outgoing'):
+        if direction in GATE_DIRECTIONS:
             for tid, tr in tracks.items():
                 avg_score = tr.get('score_sum', tr['best_score']) / max(1, tr['hits'])
                 is_confirmed = (
@@ -2559,7 +2595,7 @@ class Engine:
 
     def remaining_cameras_live(self):
         """Return live in-memory vehicle counts for non-gate cameras or gate cameras with counting disabled (not saved to DB)."""
-        devices = [d for d in self.store.devices() if d.get('role') not in ('entry', 'exit') or not d.get('count_enabled', True)]
+        devices = [d for d in self.store.devices() if d.get('role') not in COUNTABLE_ROLE_DIRECTION or not d.get('count_enabled', True)]
         out = []
         with self.lock:
             for d in devices:

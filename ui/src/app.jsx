@@ -42,7 +42,64 @@ function dwell(ms) {
 function roleColor(role) {
   if (role === 'entry') return 'var(--teal)';
   if (role === 'exit') return 'var(--gold)';
+  if (role === 'basement_entry' || role === 'basement') return '#ea580c';
+  if (role === 'basement_exit') return '#d97706';
   return 'var(--purple)';
+}
+
+const CAMERA_ROLE_OPTIONS = [
+  { value: 'entry', label: '🟢 Entry Gate' },
+  { value: 'exit', label: '🔵 Exit Gate' },
+  { value: 'porch', label: '🟣 Main Porch / Drop-off' },
+  { value: 'basement_entry', label: '🟠 Basement Entry' },
+  { value: 'basement_exit', label: '🟡 Basement Exit' },
+  { value: 'emergency', label: '🔴 Emergency Drop-off' },
+  { value: 'checkpoint', label: '📍 General Checkpoint' },
+];
+
+const COUNTABLE_CAMERA_ROLES = new Set(['entry', 'exit', 'basement_entry', 'basement_exit', 'basement']);
+
+function normalizeCameraRole(role) {
+  const r = String(role || 'checkpoint').toLowerCase();
+  return r === 'basement' ? 'basement_entry' : r;
+}
+
+function formatRoleLabel(role) {
+  if (role === 'basement_entry' || role === 'basement') return 'basement entry';
+  if (role === 'basement_exit') return 'basement exit';
+  return role || 'checkpoint';
+}
+
+function getDirectionMeta(dir) {
+  if (dir === 'incoming') return { label: 'INCOMING', pill: 'in' };
+  if (dir === 'outgoing') return { label: 'OUTGOING', pill: 'out' };
+  if (dir === 'basement_incoming') return { label: 'BASEMENT ENTRY', pill: 'base-in' };
+  if (dir === 'basement_outgoing') return { label: 'BASEMENT EXIT', pill: 'base-out' };
+  return { label: String(dir || '').toUpperCase(), pill: 'out' };
+}
+
+function GateCountingFields({ role, gateGroup, setGateGroup, countEnabled, setCountEnabled }) {
+  if (!COUNTABLE_CAMERA_ROLES.has(role)) return null;
+  const isBasement = role === 'basement_entry' || role === 'basement_exit' || role === 'basement';
+  return (
+    <div style={{ padding: '10px 12px', background: '#f8fafd', border: '1px solid #e1e7f0', borderRadius: 8, marginBottom: 12 }}>
+      <div className="field" style={{ marginBottom: 8 }}>
+        <span>Gate / Location Group (Optional)</span>
+        <input
+          placeholder={isBasement ? 'e.g. Basement Gate (blank = auto-dedup same-direction)' : 'e.g. Main Gate (blank = auto-dedup all same-role cameras)'}
+          value={gateGroup}
+          onChange={e => setGateGroup(e.target.value)}
+        />
+        <small style={{ color: '#64748b', fontSize: 10 }}>
+          Cameras with the same Role &amp; Group merge into 1 physical vehicle count.
+        </small>
+      </div>
+      <label className="check">
+        <input type="checkbox" checked={countEnabled} onChange={e => setCountEnabled(e.target.checked)} />
+        Save counts to Gate History DB (uncheck for Live-Only ANPR)
+      </label>
+    </div>
+  );
 }
 
 async function api(path, body) {
@@ -60,6 +117,19 @@ function KpiCard({ label, value, sub, color }) {
       <b>{value ?? '—'}</b>
       {sub && <small>{sub}</small>}
     </div>
+  );
+}
+
+function BasementInKpiCard({ vehicleCounts }) {
+  const bIn = vehicleCounts?.basement?.incoming?.total ?? 0;
+  const bOut = vehicleCounts?.basement?.outgoing?.total ?? 0;
+  return (
+    <KpiCard
+      label="BASEMENT IN"
+      value={vehicleCounts?.basement ? bIn : '—'}
+      sub={vehicleCounts?.basement ? `${bOut} out` : '—'}
+      color="#ea580c"
+    />
   );
 }
 
@@ -480,12 +550,9 @@ function AddCameraModal({ open, onClose, onAdd }) {
               <div className="field" style={{ flex: 1 }}>
                 <span>Role / Zone</span>
                 <select value={role} onChange={e => setRole(e.target.value)}>
-                  <option value="entry">🟢 Entry Gate</option>
-                  <option value="exit">🔵 Exit Gate</option>
-                  <option value="porch">🟣 Main Porch / Drop-off</option>
-                  <option value="basement">🟠 Basement / Parking Ramp</option>
-                  <option value="emergency">🔴 Emergency Drop-off</option>
-                  <option value="checkpoint">📍 General Checkpoint</option>
+                  {CAMERA_ROLE_OPTIONS.map(opt => (
+                    <option key={opt.value} value={opt.value}>{opt.label}</option>
+                  ))}
                 </select>
               </div>
               <label className="check">
@@ -493,25 +560,13 @@ function AddCameraModal({ open, onClose, onAdd }) {
                 ANPR Enabled
               </label>
             </div>
-            {(role === 'entry' || role === 'exit') && (
-              <div style={{ padding: '10px 12px', background: '#f8fafd', border: '1px solid #e1e7f0', borderRadius: 8, marginBottom: 12 }}>
-                <div className="field" style={{ marginBottom: 8 }}>
-                  <span>Gate / Location Group (Optional)</span>
-                  <input
-                    placeholder="e.g. Main Gate (blank = auto-dedup all same-role cameras)"
-                    value={gateGroup}
-                    onChange={e => setGateGroup(e.target.value)}
-                  />
-                  <small style={{ color: '#64748b', fontSize: 10 }}>
-                    Cameras with the same Role &amp; Group merge into 1 physical vehicle count.
-                  </small>
-                </div>
-                <label className="check">
-                  <input type="checkbox" checked={countEnabled} onChange={e => setCountEnabled(e.target.checked)} />
-                  Save counts to Gate History DB (uncheck for Live-Only ANPR)
-                </label>
-              </div>
-            )}
+            <GateCountingFields
+              role={role}
+              gateGroup={gateGroup}
+              setGateGroup={setGateGroup}
+              countEnabled={countEnabled}
+              setCountEnabled={setCountEnabled}
+            />
             <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 16 }}>
               <button type="button" className="btn" onClick={onClose}>Cancel</button>
               <button type="submit" className="btn primary" disabled={busy}>
@@ -530,7 +585,7 @@ function AddCameraModal({ open, onClose, onAdd }) {
 function EditCameraModal({ device, open, onClose, onSave, onDelete }) {
   const [name, setName] = useState(device?.name || '');
   const [url, setUrl] = useState(device?.url || '');
-  const [role, setRole] = useState(device?.role || 'checkpoint');
+  const [role, setRole] = useState(normalizeCameraRole(device?.role));
   const [anpr, setAnpr] = useState(device?.anpr ?? true);
   const [gateGroup, setGateGroup] = useState(device?.gate_group || '');
   const [countEnabled, setCountEnabled] = useState(device?.count_enabled ?? true);
@@ -540,7 +595,7 @@ function EditCameraModal({ device, open, onClose, onSave, onDelete }) {
     if (device) {
       setName(device.name);
       setUrl(device.url || '');
-      setRole(device.role);
+      setRole(normalizeCameraRole(device.role));
       setAnpr(device.anpr);
       setGateGroup(device.gate_group || '');
       setCountEnabled(device.count_enabled ?? true);
@@ -598,12 +653,9 @@ function EditCameraModal({ device, open, onClose, onSave, onDelete }) {
             <div className="field" style={{ flex: 1 }}>
               <span>Role / Zone</span>
               <select value={role} onChange={e => setRole(e.target.value)}>
-                <option value="entry">🟢 Entry Gate</option>
-                <option value="exit">🔵 Exit Gate</option>
-                <option value="porch">🟣 Main Porch / Drop-off</option>
-                <option value="basement">🟠 Basement / Parking Ramp</option>
-                <option value="emergency">🔴 Emergency Drop-off</option>
-                <option value="checkpoint">📍 General Checkpoint</option>
+                {CAMERA_ROLE_OPTIONS.map(opt => (
+                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                ))}
               </select>
             </div>
             <label className="check">
@@ -611,25 +663,13 @@ function EditCameraModal({ device, open, onClose, onSave, onDelete }) {
               ANPR Enabled
             </label>
           </div>
-          {(role === 'entry' || role === 'exit') && (
-            <div style={{ padding: '10px 12px', background: '#f8fafd', border: '1px solid #e1e7f0', borderRadius: 8, marginBottom: 12 }}>
-              <div className="field" style={{ marginBottom: 8 }}>
-                <span>Gate / Location Group (Optional)</span>
-                <input
-                  placeholder="e.g. Main Gate (blank = auto-dedup all same-role cameras)"
-                  value={gateGroup}
-                  onChange={e => setGateGroup(e.target.value)}
-                />
-                <small style={{ color: '#64748b', fontSize: 10 }}>
-                  Cameras with the same Role &amp; Group merge into 1 physical vehicle count.
-                </small>
-              </div>
-              <label className="check">
-                <input type="checkbox" checked={countEnabled} onChange={e => setCountEnabled(e.target.checked)} />
-                Save counts to Gate History DB (uncheck for Live-Only ANPR)
-              </label>
-            </div>
-          )}
+          <GateCountingFields
+            role={role}
+            gateGroup={gateGroup}
+            setGateGroup={setGateGroup}
+            countEnabled={countEnabled}
+            setCountEnabled={setCountEnabled}
+          />
           <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 16 }}>
             <button className="btn danger" onClick={handleDelete} disabled={busy}>Remove</button>
             <button className="btn" onClick={onClose}>Cancel</button>
@@ -683,13 +723,13 @@ function RegisteredCameras({ devices, activeSlots, onToggleViewSlot, onEditCamer
                   {d.url || d.stream}
                 </small>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap', marginTop: 1 }}>
-                  <span className={`badge ${d.role}`} style={{ fontSize: 8 }}>{d.role}</span>
-                  {(d.role === 'entry' || d.role === 'exit') && d.gate_group && (
+                  <span className={`badge ${d.role}`} style={{ fontSize: 8 }}>{formatRoleLabel(d.role)}</span>
+                  {COUNTABLE_CAMERA_ROLES.has(d.role) && d.gate_group && (
                     <span className="badge" style={{ background: '#e0e7ff', color: '#3730a3', fontSize: 8 }} title={`Gate Group: ${d.gate_group}`}>
                       {d.gate_group}
                     </span>
                   )}
-                  {(d.role === 'entry' || d.role === 'exit') && d.count_enabled === false && (
+                  {COUNTABLE_CAMERA_ROLES.has(d.role) && d.count_enabled === false && (
                     <span className="badge" style={{ background: '#fef3c7', color: '#92400e', fontSize: 8 }} title="Excluded from Gate DB counts (Live-Only)">
                       Live Only
                     </span>
@@ -849,8 +889,11 @@ function getDeviceZone(device) {
   if (role === 'porch' || name.includes('porch') || name.includes('drop-off')) {
     return { key: 'porch', label: 'Porch', icon: '🟣', badgeBg: '#f3e8ff', badgeColor: '#7e22ce', barColor: '#9333ea' };
   }
-  if (role === 'basement' || name.includes('basement') || name.includes('ramp')) {
-    return { key: 'basement', label: 'Basement', icon: '🟠', badgeBg: '#ffedd5', badgeColor: '#c2410c', barColor: '#ea580c' };
+  if (role === 'basement_exit' || name.includes('basement exit')) {
+    return { key: 'basement_exit', label: 'Basement Exit', icon: '🟡', badgeBg: '#fef3c7', badgeColor: '#a16207', barColor: '#d97706' };
+  }
+  if (role === 'basement_entry' || role === 'basement' || name.includes('basement') || name.includes('ramp')) {
+    return { key: 'basement_entry', label: 'Basement Entry', icon: '🟠', badgeBg: '#ffedd5', badgeColor: '#c2410c', barColor: '#ea580c' };
   }
   if (role === 'parking' || name.includes('parking')) {
     return { key: 'parking', label: 'Parking', icon: '🅿️', badgeBg: '#e0f2fe', badgeColor: '#0369a1', barColor: '#0284c7' };
@@ -864,7 +907,6 @@ function getDeviceZone(device) {
 /* ── Gate Traffic & Camera Flow Analysis ──────────────────── */
 
 function GateAnalyticsCard({ analytics, devices, timeFilter, setTimeFilter }) {
-  const [timelineMode, setTimelineMode] = useState('hourly'); // 'hourly' | 'daily'
   const perCamera = analytics?.per_camera || {};
 
   const entryDevices = (devices || []).filter(d => d.role === 'entry');
@@ -879,38 +921,6 @@ function GateAnalyticsCard({ analytics, devices, timeFilter, setTimeFilter }) {
   const inferredExits = Math.max(0, totalExited - cameraExits);
   const totalInternal = internalDevices.reduce((sum, d) => sum + (perCamera[d.stream] || 0), 0);
   const clearanceRate = totalEntries > 0 ? Math.round((totalExited / totalEntries) * 100) : 0;
-
-  // Hourly timeline
-  const hourly = analytics?.hourly_entries || [];
-
-  // Daily timeline aggregation
-  const dailyEntries = useMemo(() => {
-    const map = {};
-    (analytics?.hourly_entries || []).forEach(h => {
-      const d = new Date(h.bucket);
-      const dayLabel = d.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short' });
-      map[dayLabel] = (map[dayLabel] || 0) + h.count;
-    });
-    return Object.entries(map).map(([dayLabel, count]) => ({ dayLabel, count }));
-  }, [analytics?.hourly_entries]);
-
-  // Determine active timeline data based on mode or active filter
-  const isDaily = timelineMode === 'daily' || timeFilter === '7d';
-  const timelineItems = isDaily ? dailyEntries : hourly;
-
-  const maxPeak = Math.max(...timelineItems.map(item => item.count), 1);
-  const windowTotal = timelineItems.reduce((acc, item) => acc + (item.count || 0), 0);
-  const windowAvg = timelineItems.length > 0 ? Math.round(windowTotal / timelineItems.length) : 0;
-  const normalizedBars = timelineItems.map(item => {
-    const label = isDaily
-      ? item.dayLabel
-      : new Date(item.bucket).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: 'numeric', hour12: true });
-    return {
-      key: isDaily ? item.dayLabel : item.bucket,
-      label,
-      count: item.count || 0
-    };
-  });
 
   return (
     <div className="card">
@@ -1124,118 +1134,153 @@ function GateAnalyticsCard({ analytics, devices, timeFilter, setTimeFilter }) {
             </div>
           </div>
         </div>
+      </div>
+    </div>
+  );
+}
 
-        {/* Hourly vs Daily Traffic Volume Timeline */}
-        {normalizedBars.length > 0 && (
-          <div className="tl-card">
-            <div className="tl-head">
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-                <span style={{ fontWeight: 800, fontSize: 13, color: '#0f172a', display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                  📈 {isDaily ? 'Daily Traffic Volume' : 'Inflow Volume Timeline'}
-                  <span style={{ fontSize: 10, fontWeight: 600, color: '#64748b' }}>
-                    ({isDaily ? 'Daily Trend' : 'Hourly Pulse'})
-                  </span>
-                </span>
-                {/* Granularity Switcher: Hourly vs Daily */}
-                <div style={{ display: 'inline-flex', background: '#e2e8f0', borderRadius: 7, padding: 2 }}>
-                  <button
-                    type="button"
-                    onClick={() => setTimelineMode('hourly')}
-                    style={{
-                      padding: '3px 9px', fontSize: 10, fontWeight: 700, border: 'none', borderRadius: 5,
-                      background: !isDaily ? '#fff' : 'transparent',
-                      color: !isDaily ? '#0f172a' : '#64748b', cursor: 'pointer',
-                      boxShadow: !isDaily ? '0 1px 3px rgba(0,0,0,0.1)' : 'none'
-                    }}
-                  >
-                    ⏱ Hourly
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setTimelineMode('daily')}
-                    style={{
-                      padding: '3px 9px', fontSize: 10, fontWeight: 700, border: 'none', borderRadius: 5,
-                      background: isDaily ? '#fff' : 'transparent',
-                      color: isDaily ? '#0f172a' : '#64748b', cursor: 'pointer',
-                      boxShadow: isDaily ? '0 1px 3px rgba(0,0,0,0.1)' : 'none'
-                    }}
-                  >
-                    📅 Daily
-                  </button>
-                </div>
-              </div>
+/* ── Inflow Volume Timeline (Hourly / Daily Pulse Card) ──────── */
 
-              {/* Metrics Summary Pills */}
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                <span className="tl-pill peak">
-                  🔥 Peak: <b>{maxPeak.toLocaleString()}</b> {isDaily ? '/day' : '/hr'}
-                </span>
-                <span className="tl-pill">
-                  Avg: <b>{windowAvg.toLocaleString()}</b>
-                </span>
-                <span className={`tl-pill total ${isDaily ? 'daily' : ''}`}>
-                  Total: <b>{windowTotal.toLocaleString()}</b>
-                </span>
-              </div>
+function InflowVolumeTimelineCard({ analytics, timeFilter }) {
+  const [timelineMode, setTimelineMode] = useState('hourly'); // 'hourly' | 'daily'
+
+  const hourly = analytics?.hourly_entries || [];
+  const dailyEntries = useMemo(() => {
+    const map = {};
+    (analytics?.hourly_entries || []).forEach(h => {
+      const d = new Date(h.bucket);
+      const dayLabel = d.toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short' });
+      map[dayLabel] = (map[dayLabel] || 0) + h.count;
+    });
+    return Object.entries(map).map(([dayLabel, count]) => ({ dayLabel, count }));
+  }, [analytics?.hourly_entries]);
+
+  const isDaily = timelineMode === 'daily' || timeFilter === '7d';
+  const timelineItems = isDaily ? dailyEntries : hourly;
+
+  const maxPeak = Math.max(...timelineItems.map(item => item.count), 1);
+  const windowTotal = timelineItems.reduce((acc, item) => acc + (item.count || 0), 0);
+  const windowAvg = timelineItems.length > 0 ? Math.round(windowTotal / timelineItems.length) : 0;
+  const normalizedBars = timelineItems.map(item => {
+    const label = isDaily
+      ? item.dayLabel
+      : new Date(item.bucket).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: 'numeric', hour12: true });
+    return {
+      key: isDaily ? item.dayLabel : item.bucket,
+      label,
+      count: item.count || 0
+    };
+  });
+
+  if (normalizedBars.length === 0) return null;
+
+  return (
+    <div className="tl-card" style={{ marginTop: 0, borderRadius: 16, padding: '16px 18px' }}>
+      <div className="tl-head">
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          <span style={{ fontWeight: 800, fontSize: 13, color: '#0f172a', display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            📈 {isDaily ? 'Daily Traffic Volume' : 'Inflow Volume Timeline'}
+            <span style={{ fontSize: 10, fontWeight: 600, color: '#64748b' }}>
+              ({isDaily ? 'Daily Trend' : 'Hourly Pulse'})
+            </span>
+          </span>
+          {/* Granularity Switcher: Hourly vs Daily */}
+          <div style={{ display: 'inline-flex', background: '#e2e8f0', borderRadius: 7, padding: 2 }}>
+            <button
+              type="button"
+              onClick={() => setTimelineMode('hourly')}
+              style={{
+                padding: '3px 9px', fontSize: 10, fontWeight: 700, border: 'none', borderRadius: 5,
+                background: !isDaily ? '#fff' : 'transparent',
+                color: !isDaily ? '#0f172a' : '#64748b', cursor: 'pointer',
+                boxShadow: !isDaily ? '0 1px 3px rgba(0,0,0,0.1)' : 'none'
+              }}
+            >
+              ⏱ Hourly
+            </button>
+            <button
+              type="button"
+              onClick={() => setTimelineMode('daily')}
+              style={{
+                padding: '3px 9px', fontSize: 10, fontWeight: 700, border: 'none', borderRadius: 5,
+                background: isDaily ? '#fff' : 'transparent',
+                color: isDaily ? '#0f172a' : '#64748b', cursor: 'pointer',
+                boxShadow: isDaily ? '0 1px 3px rgba(0,0,0,0.1)' : 'none'
+              }}
+            >
+              📅 Daily
+            </button>
+          </div>
+        </div>
+
+        {/* Metrics Summary Pills */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <span className="tl-pill peak">
+            🔥 Peak: <b>{maxPeak.toLocaleString()}</b> {isDaily ? '/day' : '/hr'}
+          </span>
+          <span className="tl-pill">
+            Avg: <b>{windowAvg.toLocaleString()}</b>
+          </span>
+          <span className={`tl-pill total ${isDaily ? 'daily' : ''}`}>
+            Total: <b>{windowTotal.toLocaleString()}</b>
+          </span>
+        </div>
+      </div>
+
+      {/* Chart Plot Canvas */}
+      <div className="tl-plot-wrap">
+        <div className="tl-yaxis">
+          <span>{maxPeak}</span>
+          <span>{Math.round(maxPeak / 2)}</span>
+          <span>0</span>
+        </div>
+
+        <div className="tl-canvas">
+          <div className="tl-canvas-inner" style={{ minWidth: normalizedBars.length > 8 ? `${normalizedBars.length * 64}px` : '100%' }}>
+            <div className="tl-gridlines">
+              <div className="tl-gridline" />
+              <div className="tl-gridline" />
+              <div className="tl-gridline base" />
             </div>
 
-            {/* Chart Plot Canvas */}
-            <div className="tl-plot-wrap">
-              <div className="tl-yaxis">
-                <span>{maxPeak}</span>
-                <span>{Math.round(maxPeak / 2)}</span>
-                <span>0</span>
+            {normalizedBars.length > 1 && windowAvg > 0 && (
+              <div
+                className="tl-avg-line"
+                style={{
+                  top: `${24 + Math.round(Math.max(0, Math.min(1, 1 - windowAvg / maxPeak)) * 108)}px`
+                }}
+              >
+                <span className="tl-avg-tag">avg {windowAvg}</span>
               </div>
+            )}
 
-              <div className="tl-canvas">
-                <div className="tl-canvas-inner" style={{ minWidth: normalizedBars.length > 8 ? `${normalizedBars.length * 64}px` : '100%' }}>
-                  <div className="tl-gridlines">
-                    <div className="tl-gridline" />
-                    <div className="tl-gridline" />
-                    <div className="tl-gridline base" />
-                  </div>
-
-                  {normalizedBars.length > 1 && windowAvg > 0 && (
-                    <div
-                      className="tl-avg-line"
-                      style={{
-                        top: `${24 + Math.round(Math.max(0, Math.min(1, 1 - windowAvg / maxPeak)) * 108)}px`
-                      }}
-                    >
-                      <span className="tl-avg-tag">avg {windowAvg}</span>
+            <div className="tl-bars">
+              {normalizedBars.map(bar => {
+                const barPx = bar.count > 0 ? Math.max(6, Math.round((bar.count / maxPeak) * 108)) : 3;
+                const sharePct = windowTotal > 0 ? Math.round((bar.count / windowTotal) * 100) : 0;
+                const isPeak = bar.count === maxPeak && maxPeak > 0;
+                const modeClass = isDaily ? 'daily' : 'hourly';
+                return (
+                  <div key={bar.key} className="tl-col" title={`${bar.label}: ${bar.count.toLocaleString()} vehicles (${sharePct}% of window)`}>
+                    <div className="tl-track">
+                      <span className={`tl-val ${isPeak ? 'peak' : ''}`}>
+                        {isPeak ? '★ ' : ''}{bar.count.toLocaleString()}
+                      </span>
+                      <div
+                        className={`tl-bar ${modeClass} ${isPeak ? 'peak' : ''}`}
+                        style={{ height: `${barPx}px` }}
+                      />
                     </div>
-                  )}
-
-                  <div className="tl-bars">
-                    {normalizedBars.map(bar => {
-                      const barPx = bar.count > 0 ? Math.max(6, Math.round((bar.count / maxPeak) * 108)) : 3;
-                      const sharePct = windowTotal > 0 ? Math.round((bar.count / windowTotal) * 100) : 0;
-                      const isPeak = bar.count === maxPeak && maxPeak > 0;
-                      const modeClass = isDaily ? 'daily' : 'hourly';
-                      return (
-                        <div key={bar.key} className="tl-col" title={`${bar.label}: ${bar.count.toLocaleString()} vehicles (${sharePct}% of window)`}>
-                          <div className="tl-track">
-                            <span className={`tl-val ${isPeak ? 'peak' : ''}`}>
-                              {isPeak ? '★ ' : ''}{bar.count.toLocaleString()}
-                            </span>
-                            <div
-                              className={`tl-bar ${modeClass} ${isPeak ? 'peak' : ''}`}
-                              style={{ height: `${barPx}px` }}
-                            />
-                          </div>
-                          <div className="tl-xlab">
-                            <b>{bar.label}</b>
-                            <small>{sharePct}%</small>
-                          </div>
-                        </div>
-                      );
-                    })}
+                    <div className="tl-xlab">
+                      <b>{bar.label}</b>
+                      <small>{sharePct}%</small>
+                    </div>
                   </div>
-                </div>
-              </div>
+                );
+              })}
             </div>
           </div>
-        )}
+        </div>
       </div>
     </div>
   );
@@ -1250,129 +1295,202 @@ const VEHICLE_TYPE_META = [
   { key: 'ambulance', label: 'Ambulances', singular: 'Ambulance', icon: '🚑', color: '#b82323', bg: '#feebeb' },
 ];
 
+function VehicleCountMatrixCard({
+  title,
+  subtitle,
+  inLabel,
+  outLabel,
+  inPillClass = 'in',
+  outPillClass = 'out',
+  totalLabel,
+  allTimeLabel,
+  incoming,
+  outgoing,
+  allTimeIn = 0,
+  allTimeOut = 0,
+  range,
+  setRange,
+  customStart,
+  setCustomStart,
+  customEnd,
+  setCustomEnd,
+  onOpenHistory
+}) {
+  const totalNet = Math.max(0, (incoming.total || 0) - (outgoing.total || 0));
+
+  return (
+    <div className="card">
+      <div className="head" style={{ flexWrap: 'wrap', gap: 8 }}>
+        <div>
+          <h3>{title}</h3>
+          <small>{subtitle}</small>
+        </div>
+      </div>
+
+      <div className="body" style={{ padding: '12px 16px' }}>
+        {/* Historical Range Quick Switcher */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap', marginBottom: 10 }}>
+          {[
+            { k: '1h', label: '1h' },
+            { k: 'today', label: 'Today' },
+            { k: '24h', label: '24h' },
+            { k: '7d', label: '7d' },
+            { k: 'all', label: 'All Time' },
+            { k: 'custom', label: '📅 Custom' },
+          ].map(item => (
+            <button
+              key={item.k}
+              type="button"
+              className={`vc-range-btn ${range === item.k ? 'active' : ''}`}
+              onClick={() => setRange(item.k)}
+            >
+              {item.label}
+            </button>
+          ))}
+        </div>
+
+        {range === 'custom' && (
+          <div style={{ display: 'grid', gap: 6, padding: 8, background: '#f8fafd', border: '1px solid #e1e7f0', borderRadius: 8, marginBottom: 10 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6 }}>
+              <span style={{ fontSize: 10, fontWeight: 700, color: '#5d7089' }}>From:</span>
+              <input
+                type="datetime-local"
+                value={customStart}
+                onChange={e => setCustomStart(e.target.value)}
+                style={{ flex: 1, fontSize: 10, padding: '3px 6px', border: '1px solid #dfe6f0', borderRadius: 5 }}
+              />
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6 }}>
+              <span style={{ fontSize: 10, fontWeight: 700, color: '#5d7089' }}>To:</span>
+              <input
+                type="datetime-local"
+                value={customEnd}
+                onChange={e => setCustomEnd(e.target.value)}
+                style={{ flex: 1, fontSize: 10, padding: '3px 6px', border: '1px solid #dfe6f0', borderRadius: 5 }}
+              />
+            </div>
+          </div>
+        )}
+
+        {/* Incoming vs Outgoing Breakdown Table */}
+        <table className="vc-matrix">
+          <thead>
+            <tr>
+              <th>Vehicle Type</th>
+              <th className="num">{inLabel}</th>
+              <th className="num">{outLabel}</th>
+              <th className="num">Net</th>
+            </tr>
+          </thead>
+          <tbody>
+            {VEHICLE_TYPE_META.map(vt => {
+              const inCnt = incoming[vt.key] || 0;
+              const outCnt = outgoing[vt.key] || 0;
+              const net = Math.max(0, inCnt - outCnt);
+              return (
+                <tr key={vt.key} style={vt.key === 'ambulance' ? { background: '#fffafa' } : undefined}>
+                  <td>
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                      <span>{vt.icon}</span>
+                      <span style={{ fontWeight: 700, color: vt.key === 'ambulance' ? '#991b1b' : '#1e293b' }}>
+                        {vt.label}
+                      </span>
+                    </span>
+                  </td>
+                  <td className="num"><span className={`vc-pill ${inPillClass}`}>{inCnt}</span></td>
+                  <td className="num"><span className={`vc-pill ${outPillClass}`}>{outCnt}</span></td>
+                  <td className="num">
+                    <span className={`vc-pill ${net > 0 ? 'net-pos' : 'net-zero'}`}>
+                      {net > 0 ? `+${net}` : net}
+                    </span>
+                  </td>
+                </tr>
+              );
+            })}
+            <tr style={{ background: '#f8fafc' }}>
+              <td style={{ fontWeight: 800, color: '#0f172a' }}>{totalLabel}</td>
+              <td className="num"><b style={{ color: inPillClass === 'base-in' ? '#c2410c' : '#15803d', fontSize: 12 }}>{incoming.total || 0}</b></td>
+              <td className="num"><b style={{ color: outPillClass === 'base-out' ? '#a16207' : '#1d4ed8', fontSize: 12 }}>{outgoing.total || 0}</b></td>
+              <td className="num"><b style={{ color: '#334155', fontSize: 12 }}>{totalNet > 0 ? `+${totalNet}` : totalNet}</b></td>
+            </tr>
+          </tbody>
+        </table>
+
+        {/* Footer: All-Time DB Summary + History Modal Trigger */}
+        <div style={{
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          gap: 8, marginTop: 12, paddingTop: 10, borderTop: '1px solid #eef2f7', flexWrap: 'wrap'
+        }}>
+          <small style={{ fontSize: 10, color: '#64748b', fontWeight: 600 }}>
+            {allTimeLabel}: <b>{allTimeIn}</b> in • <b>{allTimeOut}</b> out
+          </small>
+          <button type="button" className="btn sm primary" onClick={onOpenHistory} style={{ padding: '5px 10px' }}>
+            📜 Historical Records
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function SecurityVehicleCountsCard({
   data, range, setRange, customStart, setCustomStart, customEnd, setCustomEnd, onOpenHistory
 }) {
-  const incoming = data?.incoming || { car: 0, bike: 0, auto: 0, ambulance: 0, total: 0 };
-  const outgoing = data?.outgoing || { car: 0, bike: 0, auto: 0, ambulance: 0, total: 0 };
+  const emptyBucket = { car: 0, bike: 0, auto: 0, ambulance: 0, total: 0 };
+  const incoming = data?.incoming || emptyBucket;
+  const outgoing = data?.outgoing || emptyBucket;
   const allTime = data?.all_time || {};
-  const remaining = data?.remaining_cameras_live || [];
-  const totalNet = (incoming.total || 0) - (outgoing.total || 0);
+  const basementIn = data?.basement?.incoming || emptyBucket;
+  const basementOut = data?.basement?.outgoing || emptyBucket;
+  const basementAll = data?.basement?.all_time || {};
 
   return (
     <>
-      {/* 1. Saved Incoming & Outgoing Security Counts Card */}
-      <div className="card">
-        <div className="head" style={{ flexWrap: 'wrap', gap: 8 }}>
-          <div>
-            <h3>🛡️ Gate Vehicle Counts</h3>
-            <small>Incoming &amp; Outgoing • Saved in Database</small>
-          </div>
-        </div>
+      {/* 1. Saved Main Gate Incoming & Outgoing Counts Card */}
+      <VehicleCountMatrixCard
+        title="🛡️ Gate Vehicle Counts"
+        subtitle="Incoming & Outgoing • Saved in Database"
+        inLabel="🟢 Incoming"
+        outLabel="🔵 Outgoing"
+        inPillClass="in"
+        outPillClass="out"
+        totalLabel="Total Gate Flow"
+        allTimeLabel="All-time DB"
+        incoming={incoming}
+        outgoing={outgoing}
+        allTimeIn={allTime.incoming?.total || 0}
+        allTimeOut={allTime.outgoing?.total || 0}
+        range={range}
+        setRange={setRange}
+        customStart={customStart}
+        setCustomStart={setCustomStart}
+        customEnd={customEnd}
+        setCustomEnd={setCustomEnd}
+        onOpenHistory={() => onOpenHistory('main')}
+      />
 
-        <div className="body" style={{ padding: '12px 16px' }}>
-          {/* Historical Range Quick Switcher */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap', marginBottom: 10 }}>
-            {[
-              { k: '1h', label: '1h' },
-              { k: 'today', label: 'Today' },
-              { k: '24h', label: '24h' },
-              { k: '7d', label: '7d' },
-              { k: 'all', label: 'All Time' },
-              { k: 'custom', label: '📅 Custom' },
-            ].map(item => (
-              <button
-                key={item.k}
-                type="button"
-                className={`vc-range-btn ${range === item.k ? 'active' : ''}`}
-                onClick={() => setRange(item.k)}
-              >
-                {item.label}
-              </button>
-            ))}
-          </div>
-
-          {range === 'custom' && (
-            <div style={{ display: 'grid', gap: 6, padding: 8, background: '#f8fafd', border: '1px solid #e1e7f0', borderRadius: 8, marginBottom: 10 }}>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6 }}>
-                <span style={{ fontSize: 10, fontWeight: 700, color: '#5d7089' }}>From:</span>
-                <input
-                  type="datetime-local"
-                  value={customStart}
-                  onChange={e => setCustomStart(e.target.value)}
-                  style={{ flex: 1, fontSize: 10, padding: '3px 6px', border: '1px solid #dfe6f0', borderRadius: 5 }}
-                />
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6 }}>
-                <span style={{ fontSize: 10, fontWeight: 700, color: '#5d7089' }}>To:</span>
-                <input
-                  type="datetime-local"
-                  value={customEnd}
-                  onChange={e => setCustomEnd(e.target.value)}
-                  style={{ flex: 1, fontSize: 10, padding: '3px 6px', border: '1px solid #dfe6f0', borderRadius: 5 }}
-                />
-              </div>
-            </div>
-          )}
-
-          {/* Incoming vs Outgoing Breakdown Table */}
-          <table className="vc-matrix">
-            <thead>
-              <tr>
-                <th>Vehicle Type</th>
-                <th className="num">🟢 Incoming</th>
-                <th className="num">🔵 Outgoing</th>
-                <th className="num">Net</th>
-              </tr>
-            </thead>
-            <tbody>
-              {VEHICLE_TYPE_META.map(vt => {
-                const inCnt = incoming[vt.key] || 0;
-                const outCnt = outgoing[vt.key] || 0;
-                const net = inCnt - outCnt;
-                return (
-                  <tr key={vt.key} style={vt.key === 'ambulance' ? { background: '#fffafa' } : undefined}>
-                    <td>
-                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                        <span>{vt.icon}</span>
-                        <span style={{ fontWeight: 700, color: vt.key === 'ambulance' ? '#991b1b' : '#1e293b' }}>
-                          {vt.label}
-                        </span>
-                      </span>
-                    </td>
-                    <td className="num"><span className="vc-pill in">{inCnt}</span></td>
-                    <td className="num"><span className="vc-pill out">{outCnt}</span></td>
-                    <td className="num">
-                      <span className={`vc-pill ${net > 0 ? 'net-pos' : 'net-zero'}`}>
-                        {net > 0 ? `+${net}` : net}
-                      </span>
-                    </td>
-                  </tr>
-                );
-              })}
-              <tr style={{ background: '#f8fafc' }}>
-                <td style={{ fontWeight: 800, color: '#0f172a' }}>Total Gate Flow</td>
-                <td className="num"><b style={{ color: '#15803d', fontSize: 12 }}>{incoming.total || 0}</b></td>
-                <td className="num"><b style={{ color: '#1d4ed8', fontSize: 12 }}>{outgoing.total || 0}</b></td>
-                <td className="num"><b style={{ color: '#334155', fontSize: 12 }}>{totalNet > 0 ? `+${totalNet}` : totalNet}</b></td>
-              </tr>
-            </tbody>
-          </table>
-
-          {/* Footer: All-Time DB Summary + History Modal Trigger */}
-          <div style={{
-            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-            gap: 8, marginTop: 12, paddingTop: 10, borderTop: '1px solid #eef2f7', flexWrap: 'wrap'
-          }}>
-            <small style={{ fontSize: 10, color: '#64748b', fontWeight: 600 }}>
-              All-time DB: <b>{allTime.incoming?.total || 0}</b> in • <b>{allTime.outgoing?.total || 0}</b> out
-            </small>
-            <button type="button" className="btn sm primary" onClick={onOpenHistory} style={{ padding: '5px 10px' }}>
-              📜 Historical Records
-            </button>
-          </div>
-        </div>
-      </div>
+      {/* 2. Separate Basement Entry & Basement Exit Counts Card */}
+      <VehicleCountMatrixCard
+        title="🅿️ Gate Vehicle Counts — Basement"
+        subtitle="Basement Entry & Basement Exit • Saved in Database"
+        inLabel="🟠 Basement Entry"
+        outLabel="🟡 Basement Exit"
+        inPillClass="base-in"
+        outPillClass="base-out"
+        totalLabel="Total Basement Flow"
+        allTimeLabel="All-time Basement DB"
+        incoming={basementIn}
+        outgoing={basementOut}
+        allTimeIn={basementAll.incoming?.total || 0}
+        allTimeOut={basementAll.outgoing?.total || 0}
+        range={range}
+        setRange={setRange}
+        customStart={customStart}
+        setCustomStart={setCustomStart}
+        customEnd={customEnd}
+        setCustomEnd={setCustomEnd}
+        onOpenHistory={() => onOpenHistory('basement')}
+      />
     </>
   );
 }
@@ -1393,7 +1511,6 @@ function OtherCamerasLiveCard({ remaining = [] }) {
           <div className="vc-live-grid">
             {remaining.map(cam => {
               const inf = cam.in_frame || { car: 0, bike: 0, auto: 0, ambulance: 0, total: 0 };
-              const sess = cam.session || { car: 0, bike: 0, auto: 0, ambulance: 0, total: 0 };
               return (
                 <div key={cam.stream} className="vc-live-row">
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
@@ -1408,8 +1525,8 @@ function OtherCamerasLiveCard({ remaining = [] }) {
                       <b style={{ fontSize: 12, color: '#1e293b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={cam.name}>
                         {cam.name}
                       </b>
-                      <span className={`badge ${cam.role}`} style={{ fontSize: 8 }}>{cam.role}</span>
-                      {(cam.role === 'entry' || cam.role === 'exit') && cam.count_enabled === false && (
+                      <span className={`badge ${cam.role}`} style={{ fontSize: 8 }}>{formatRoleLabel(cam.role)}</span>
+                      {COUNTABLE_CAMERA_ROLES.has(cam.role) && cam.count_enabled === false && (
                         <span className="badge" style={{ background: '#fef3c7', color: '#92400e', fontSize: 8 }}>DB Off</span>
                       )}
                     </div>
@@ -1420,10 +1537,9 @@ function OtherCamerasLiveCard({ remaining = [] }) {
 
                   <div className="vc-mini-grid">
                     {VEHICLE_TYPE_META.map(vt => (
-                      <div key={vt.key} className="vc-mini-chip" title={`In view: ${inf[vt.key] || 0} | Live session tracked: ${sess[vt.key] || 0}`}>
+                      <div key={vt.key} className="vc-mini-chip" title={`In view: ${inf[vt.key] || 0}`}>
                         <span>{vt.icon} {vt.label}</span>
                         <b>{inf[vt.key] || 0}</b>
-                        <span style={{ fontSize: 8, color: '#94a3b8', marginTop: 1 }}>sess: {sess[vt.key] || 0}</span>
                       </div>
                     ))}
                   </div>
@@ -1443,10 +1559,19 @@ function OtherCamerasLiveCard({ remaining = [] }) {
 
 /* ── Historical Incoming & Outgoing Security Modal ─────────── */
 
-function exportGateHistoryToExcel({ data, rangeLabel, granularity, dirFilter, typeFilter }) {
+function exportGateHistoryToExcel({ data, scope = 'main', rangeLabel, granularity, dirFilter, typeFilter }) {
   const wb = XLSX.utils.book_new();
-  const inc = data?.incoming || { car: 0, bike: 0, auto: 0, ambulance: 0, total: 0 };
-  const out = data?.outgoing || { car: 0, bike: 0, auto: 0, ambulance: 0, total: 0 };
+  const isBasement = scope === 'basement';
+  const emptyBucket = { car: 0, bike: 0, auto: 0, ambulance: 0, total: 0 };
+  const inc = isBasement ? (data?.basement?.incoming || emptyBucket) : (data?.incoming || emptyBucket);
+  const out = isBasement ? (data?.basement?.outgoing || emptyBucket) : (data?.outgoing || emptyBucket);
+  const allowedDirs = isBasement ? ['basement_incoming', 'basement_outgoing'] : ['incoming', 'outgoing'];
+  const inDirKey = isBasement ? 'basement_incoming' : 'incoming';
+  const outDirKey = isBasement ? 'basement_outgoing' : 'outgoing';
+  const inColLabel = isBasement ? 'Basement Entry' : 'Incoming';
+  const outColLabel = isBasement ? 'Basement Exit' : 'Outgoing';
+  const inBucketPrefix = isBasement ? 'Entry' : 'In';
+  const outBucketPrefix = isBasement ? 'Exit' : 'Out';
   const resolvedGranularity = data?.window?.granularity || granularity || 'hourly';
   const isDaily = resolvedGranularity === 'daily';
 
@@ -1454,13 +1579,13 @@ function exportGateHistoryToExcel({ data, rangeLabel, granularity, dirFilter, ty
     ? VEHICLE_TYPE_META
     : VEHICLE_TYPE_META.filter(vt => vt.key === typeFilter);
 
-  const showIn = dirFilter !== 'outgoing';
-  const showOut = dirFilter !== 'incoming';
+  const showIn = dirFilter === 'all' || dirFilter === inDirKey;
+  const showOut = dirFilter === 'all' || dirFilter === outDirKey;
 
   // Build Summary & Gate-wise tables
   const summaryHeader = ['Vehicle Type'];
-  if (showIn) summaryHeader.push('Incoming');
-  if (showOut) summaryHeader.push('Outgoing');
+  if (showIn) summaryHeader.push(inColLabel);
+  if (showOut) summaryHeader.push(outColLabel);
   if (showIn && showOut) summaryHeader.push('Net Flow');
 
   const summaryRows = typeEntries.map(vt => {
@@ -1469,40 +1594,43 @@ function exportGateHistoryToExcel({ data, rangeLabel, granularity, dirFilter, ty
     const row = [vt.label];
     if (showIn) row.push(iVal);
     if (showOut) row.push(oVal);
-    if (showIn && showOut) row.push(iVal - oVal);
+    if (showIn && showOut) row.push(Math.max(0, iVal - oVal));
     return row;
   });
   if (typeFilter === 'all') {
     const totIn = Number(inc.total || 0);
     const totOut = Number(out.total || 0);
-    const totRow = ['Total Gate Flow'];
+    const totRow = [isBasement ? 'Total Basement Flow' : 'Total Gate Flow'];
     if (showIn) totRow.push(totIn);
     if (showOut) totRow.push(totOut);
-    if (showIn && showOut) totRow.push(totIn - totOut);
+    if (showIn && showOut) totRow.push(Math.max(0, totIn - totOut));
     summaryRows.push(totRow);
   }
 
-  const camFiltered = (data?.by_camera || []).filter(c => dirFilter === 'all' || c.direction === dirFilter);
+  const camFiltered = (data?.by_camera || []).filter(
+    c => allowedDirs.includes(c.direction) && (dirFilter === 'all' || c.direction === dirFilter)
+  );
   const camHeader = ['Gate Camera', 'Direction', ...typeEntries.map(vt => vt.label), 'Total'];
   const camRows = camFiltered.map(c => {
     const vals = typeEntries.map(vt => Number(c[vt.key] || 0));
     const total = typeFilter === 'all' ? Number(c.total || 0) : vals[0];
-    return [c.name, (c.direction || '').toUpperCase(), ...vals, total];
+    return [c.name, getDirectionMeta(c.direction).label.toUpperCase(), ...vals, total];
   });
 
   // Build Time-Bucket Breakdown table (selected Hourly or Daily granularity)
   const timeHeader = ['Time Period (IST)'];
   if (showIn) {
-    typeEntries.forEach(vt => timeHeader.push(`In ${vt.label}`));
-    if (typeFilter === 'all') timeHeader.push('In Total');
+    typeEntries.forEach(vt => timeHeader.push(`${inBucketPrefix} ${vt.label}`));
+    if (typeFilter === 'all') timeHeader.push(`${inBucketPrefix} Total`);
   }
   if (showOut) {
-    typeEntries.forEach(vt => timeHeader.push(`Out ${vt.label}`));
-    if (typeFilter === 'all') timeHeader.push('Out Total');
+    typeEntries.forEach(vt => timeHeader.push(`${outBucketPrefix} ${vt.label}`));
+    if (typeFilter === 'all') timeHeader.push(`${outBucketPrefix} Total`);
   }
   if (showIn && showOut) timeHeader.push('Net Flow');
 
-  const histList = [...(data?.history || [])].reverse();
+  const rawHist = isBasement ? (data?.basement?.history || []) : (data?.history || []);
+  const histList = [...rawHist].reverse();
   const totalsAcc = new Array(Math.max(0, timeHeader.length - 1)).fill(0);
   const timeRows = histList.map(b => {
     const d = new Date(b.bucket);
@@ -1524,7 +1652,7 @@ function exportGateHistoryToExcel({ data, rangeLabel, granularity, dirFilter, ty
       outSum = typeFilter === 'all' ? Number(o.total || 0) : Number(o[typeFilter] || 0);
       if (typeFilter === 'all') nums.push(outSum);
     }
-    if (showIn && showOut) nums.push(inSum - outSum);
+    if (showIn && showOut) nums.push(Math.max(0, inSum - outSum));
     nums.forEach((n, idx) => { totalsAcc[idx] += n; });
     return [lbl, ...nums];
   });
@@ -1532,16 +1660,20 @@ function exportGateHistoryToExcel({ data, rangeLabel, granularity, dirFilter, ty
     timeRows.push(['TOTAL', ...totalsAcc]);
   }
 
-  const timeSectionTitle = isDaily
-    ? 'DAILY INCOMING & OUTGOING BREAKDOWN'
-    : 'HOURLY INCOMING & OUTGOING BREAKDOWN';
+  const timeSectionTitle = isBasement
+    ? (isDaily ? 'DAILY BASEMENT ENTRY & EXIT BREAKDOWN' : 'HOURLY BASEMENT ENTRY & EXIT BREAKDOWN')
+    : (isDaily ? 'DAILY INCOMING & OUTGOING BREAKDOWN' : 'HOURLY INCOMING & OUTGOING BREAKDOWN');
+
+  const dirFilterDisplay = dirFilter === 'all'
+    ? (isBasement ? 'All Basement Directions' : 'All Main Gate Directions')
+    : getDirectionMeta(dirFilter).label;
 
   // Sheet 1: Complete Gate Audit Overview (Summary + Gate-wise + Selected Hourly/Daily Breakdown)
   const nowIst = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: true });
   const sheet1AoA = [
-    ['Medanta Hospital — Gate Vehicle Counts & Security Audit'],
+    [isBasement ? 'Medanta Hospital — Basement Gate Vehicle Counts & Audit Log' : 'Medanta Hospital — Gate Vehicle Counts & Security Audit'],
     ['Generated (IST)', nowIst, 'Window', rangeLabel],
-    ['Granularity', isDaily ? 'Daily Buckets' : 'Hourly Buckets', 'Direction', dirFilter === 'all' ? 'All Directions' : dirFilter.toUpperCase()],
+    ['Granularity', isDaily ? 'Daily Buckets' : 'Hourly Buckets', 'Direction', dirFilterDisplay],
     ['Vehicle Type Filter', typeFilter === 'all' ? 'All Vehicle Types' : typeFilter.toUpperCase()],
     [],
     ['SUMMARY BY VEHICLE TYPE'],
@@ -1559,7 +1691,7 @@ function exportGateHistoryToExcel({ data, rangeLabel, granularity, dirFilter, ty
   const maxColsS1 = Math.max(camHeader.length, timeHeader.length, 7);
   const ws1 = XLSX.utils.aoa_to_sheet(sheet1AoA);
   ws1['!cols'] = [{ wch: 28 }, { wch: 20 }, ...new Array(maxColsS1 - 2).fill(0).map(() => ({ wch: 14 }))];
-  XLSX.utils.book_append_sheet(wb, ws1, 'Gate Audit Summary');
+  XLSX.utils.book_append_sheet(wb, ws1, isBasement ? 'Basement Audit Summary' : 'Gate Audit Summary');
 
   // Sheet 2: Dedicated Selected Hourly or Daily Breakdown Tab
   const ws2 = XLSX.utils.aoa_to_sheet([timeHeader, ...(timeRows.length > 0 ? timeRows : [['No records']])]);
@@ -1568,6 +1700,7 @@ function exportGateHistoryToExcel({ data, rangeLabel, granularity, dirFilter, ty
 
   // Sheet 3: Tracked Gate Events Log
   const evFiltered = (data?.recent_events || []).filter(ev => {
+    if (!allowedDirs.includes(ev.direction)) return false;
     if (dirFilter !== 'all' && ev.direction !== dirFilter) return false;
     if (typeFilter !== 'all' && ev.vehicle_type !== typeFilter) return false;
     return true;
@@ -1576,7 +1709,7 @@ function exportGateHistoryToExcel({ data, rangeLabel, granularity, dirFilter, ty
   const evRows = evFiltered.map((ev, idx) => [
     idx + 1,
     tsDate(ev.ts),
-    (ev.direction || '').toUpperCase(),
+    getDirectionMeta(ev.direction).label.toUpperCase(),
     ev.camera || '—',
     ev.gate_group || 'Default',
     (ev.merged_cameras && ev.merged_cameras.length > 0) ? ev.merged_cameras.join(', ') : (ev.camera || '—'),
@@ -1586,19 +1719,22 @@ function exportGateHistoryToExcel({ data, rangeLabel, granularity, dirFilter, ty
   ]);
   const ws3 = XLSX.utils.aoa_to_sheet([evHeaders, ...evRows]);
   ws3['!cols'] = [
-    { wch: 7 }, { wch: 24 }, { wch: 12 }, { wch: 24 },
+    { wch: 7 }, { wch: 24 }, { wch: 16 }, { wch: 24 },
     { wch: 16 }, { wch: 28 }, { wch: 14 }, { wch: 16 }, { wch: 14 }
   ];
-  XLSX.utils.book_append_sheet(wb, ws3, 'Tracked Gate Events');
+  XLSX.utils.book_append_sheet(wb, ws3, isBasement ? 'Basement Events' : 'Tracked Gate Events');
 
   const now = new Date();
   const istDate = now.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
   const istTime = now.toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: false }).replace(':', '-');
-  XLSX.writeFile(wb, `Medanta_Gate_Vehicle_Counts_${istDate}_${istTime}.xlsx`);
+  const filePrefix = isBasement ? 'Medanta_Basement_Gate_Counts_' : 'Medanta_Gate_Vehicle_Counts_';
+  XLSX.writeFile(wb, `${filePrefix}${istDate}_${istTime}.xlsx`);
   return evFiltered.length;
 }
 
-function VehicleHistoryModal({ open, onClose, initialData }) {
+function VehicleHistoryModal({ open, scope = 'main', onClose, initialData }) {
+  const isBasement = scope === 'basement';
+  const allowedDirs = isBasement ? ['basement_incoming', 'basement_outgoing'] : ['incoming', 'outgoing'];
   const [histRange, setHistRange] = useState('24h');
   const [fromStr, setFromStr] = useState(() => {
     const d = new Date(Date.now() - 7 * 86400000);
@@ -1613,7 +1749,13 @@ function VehicleHistoryModal({ open, onClose, initialData }) {
   const [exporting, setExporting] = useState(false);
   const [exportMsg, setExportMsg] = useState(null);
 
-  const buildQuery = useCallback((limitVal = 200, includeFilters = false) => {
+  useEffect(() => {
+    if (!open) return;
+    setDirFilter('all');
+    setHistData(initialData || null);
+  }, [open, scope]);
+
+  const buildQuery = useCallback((limitVal = 200, includeTypeFilter = false) => {
     let qs = `granularity=${granularity}&limit=${limitVal}`;
     if (histRange === 'custom') {
       const fMs = new Date(fromStr).getTime() || 0;
@@ -1622,12 +1764,13 @@ function VehicleHistoryModal({ open, onClose, initialData }) {
     } else {
       qs += `&hours=${histRange === '7d' ? '168' : histRange === '30d' ? '720' : histRange === '24h' ? '24' : histRange}`;
     }
-    if (includeFilters) {
-      if (dirFilter !== 'all') qs += `&direction=${encodeURIComponent(dirFilter)}`;
-      if (typeFilter !== 'all') qs += `&type=${encodeURIComponent(typeFilter)}`;
+    const effectiveDir = dirFilter !== 'all' ? dirFilter : scope;
+    qs += `&direction=${encodeURIComponent(effectiveDir)}`;
+    if (includeTypeFilter && typeFilter !== 'all') {
+      qs += `&type=${encodeURIComponent(typeFilter)}`;
     }
     return qs;
-  }, [histRange, fromStr, toStr, granularity, dirFilter, typeFilter]);
+  }, [scope, histRange, fromStr, toStr, granularity, dirFilter, typeFilter]);
 
   const fetchHistory = useCallback(async () => {
     if (!open) return;
@@ -1655,11 +1798,16 @@ function VehicleHistoryModal({ open, onClose, initialData }) {
 
   if (!open) return null;
 
-  const incoming = histData?.incoming || { car: 0, bike: 0, auto: 0, ambulance: 0, total: 0 };
-  const outgoing = histData?.outgoing || { car: 0, bike: 0, auto: 0, ambulance: 0, total: 0 };
-  const byCamera = histData?.by_camera || [];
-  const historyRows = [...(histData?.history || [])].reverse();
+  const emptyBucket = { car: 0, bike: 0, auto: 0, ambulance: 0, total: 0 };
+  const incoming = isBasement ? (histData?.basement?.incoming || emptyBucket) : (histData?.incoming || emptyBucket);
+  const outgoing = isBasement ? (histData?.basement?.outgoing || emptyBucket) : (histData?.outgoing || emptyBucket);
+  const byCamera = (histData?.by_camera || []).filter(
+    c => allowedDirs.includes(c.direction) && (dirFilter === 'all' || c.direction === dirFilter)
+  );
+  const rawHist = isBasement ? (histData?.basement?.history || []) : (histData?.history || []);
+  const historyRows = [...rawHist].reverse();
   const events = (histData?.recent_events || []).filter(ev => {
+    if (!allowedDirs.includes(ev.direction)) return false;
     if (dirFilter !== 'all' && ev.direction !== dirFilter) return false;
     if (typeFilter !== 'all' && ev.vehicle_type !== typeFilter) return false;
     return true;
@@ -1686,6 +1834,7 @@ function VehicleHistoryModal({ open, onClose, initialData }) {
       };
       const evCount = exportGateHistoryToExcel({
         data: fullData,
+        scope,
         rangeLabel: rangeNames[histRange] || histRange,
         granularity,
         dirFilter,
@@ -1706,10 +1855,12 @@ function VehicleHistoryModal({ open, onClose, initialData }) {
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '15px 20px', borderBottom: '1px solid #eef2f7', background: '#fbfcfe', gap: 10, flexWrap: 'wrap' }}>
           <div>
             <h3 style={{ margin: 0, fontSize: 16, fontWeight: 800, color: '#172138' }}>
-              🛡️ Historical Gate Vehicle Counts &amp; Security Audit Log
+              {isBasement ? '🅿️ Historical Basement Gate Counts & Audit Log' : '🛡️ Historical Gate Vehicle Counts & Security Audit Log'}
             </h3>
             <small style={{ color: '#8ca0bc', fontSize: 11 }}>
-              Incoming &amp; outgoing vehicle breakdown saved permanently in database
+              {isBasement
+                ? 'Basement Entry & Basement Exit breakdown saved permanently in database'
+                : 'Incoming & outgoing vehicle breakdown saved permanently in database'}
             </small>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
@@ -1766,9 +1917,19 @@ function VehicleHistoryModal({ open, onClose, initialData }) {
             <option value="daily">Daily Buckets</option>
           </select>
           <select value={dirFilter} onChange={e => setDirFilter(e.target.value)} style={{ padding: '4px 8px', border: '1px solid #dfe6f0', borderRadius: 6, fontSize: 11, fontWeight: 700 }}>
-            <option value="all">All Directions</option>
-            <option value="incoming">🟢 Incoming Only</option>
-            <option value="outgoing">🔵 Outgoing Only</option>
+            {isBasement ? (
+              <>
+                <option value="all">All Basement Directions</option>
+                <option value="basement_incoming">🟠 Basement Entry</option>
+                <option value="basement_outgoing">🟡 Basement Exit</option>
+              </>
+            ) : (
+              <>
+                <option value="all">All Main Gate Directions</option>
+                <option value="incoming">🟢 Main Gate Incoming</option>
+                <option value="outgoing">🔵 Main Gate Outgoing</option>
+              </>
+            )}
           </select>
           <select value={typeFilter} onChange={e => setTypeFilter(e.target.value)} style={{ padding: '4px 8px', border: '1px solid #dfe6f0', borderRadius: 6, fontSize: 11, fontWeight: 700 }}>
             <option value="all">All Vehicle Types</option>
@@ -1796,8 +1957,8 @@ function VehicleHistoryModal({ open, onClose, initialData }) {
               <div key={vt.key} style={{ background: vt.bg, border: '1px solid #e2e8f0', borderRadius: 10, padding: '10px 14px' }}>
                 <div style={{ fontSize: 11, fontWeight: 800, color: vt.color }}>{vt.icon} {vt.label.toUpperCase()}</div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 6, fontSize: 12 }}>
-                  <span>In: <b style={{ color: '#15803d' }}>{incoming[vt.key] || 0}</b></span>
-                  <span>Out: <b style={{ color: '#1d4ed8' }}>{outgoing[vt.key] || 0}</b></span>
+                  <span>{isBasement ? 'Entry:' : 'In:'} <b style={{ color: isBasement ? '#c2410c' : '#15803d' }}>{incoming[vt.key] || 0}</b></span>
+                  <span>{isBasement ? 'Exit:' : 'Out:'} <b style={{ color: isBasement ? '#a16207' : '#1d4ed8' }}>{outgoing[vt.key] || 0}</b></span>
                 </div>
               </div>
             ))}
@@ -1820,17 +1981,20 @@ function VehicleHistoryModal({ open, onClose, initialData }) {
                   </tr>
                 </thead>
                 <tbody>
-                  {byCamera.map((c, idx) => (
-                    <tr key={c.stream + idx}>
-                      <td><b>{c.name}</b></td>
-                      <td><span className={`vc-pill ${c.direction === 'incoming' ? 'in' : 'out'}`}>{c.direction.toUpperCase()}</span></td>
-                      <td className="num">{c.car}</td>
-                      <td className="num">{c.bike}</td>
-                      <td className="num">{c.auto}</td>
-                      <td className="num">{c.ambulance}</td>
-                      <td className="num"><b>{c.total}</b></td>
-                    </tr>
-                  ))}
+                  {byCamera.map((c, idx) => {
+                    const dm = getDirectionMeta(c.direction);
+                    return (
+                      <tr key={c.stream + c.direction + idx}>
+                        <td><b>{c.name}</b></td>
+                        <td><span className={`vc-pill ${dm.pill}`}>{dm.label}</span></td>
+                        <td className="num">{c.car}</td>
+                        <td className="num">{c.bike}</td>
+                        <td className="num">{c.auto}</td>
+                        <td className="num">{c.ambulance}</td>
+                        <td className="num"><b>{c.total}</b></td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -1839,7 +2003,7 @@ function VehicleHistoryModal({ open, onClose, initialData }) {
           {/* Time-Bucket History Table */}
           <div>
             <h4 style={{ margin: '0 0 8px', fontSize: 12, color: '#334155', textTransform: 'uppercase', letterSpacing: .4 }}>
-              {histData?.window?.granularity === 'daily' ? 'Daily' : 'Hourly'} Incoming &amp; Outgoing Breakdown
+              {histData?.window?.granularity === 'daily' ? 'Daily' : 'Hourly'} {isBasement ? 'Basement Entry & Exit' : 'Incoming & Outgoing'} Breakdown
             </h4>
             {historyRows.length > 0 ? (
               <div style={{ maxHeight: 210, overflowY: 'auto', border: '1px solid #eef2f7', borderRadius: 8 }}>
@@ -1847,10 +2011,10 @@ function VehicleHistoryModal({ open, onClose, initialData }) {
                   <thead style={{ position: 'sticky', top: 0, background: '#f8fafd' }}>
                     <tr>
                       <th>Time Period (IST)</th>
-                      <th className="num">In (Car / Bike / Auto / Amb)</th>
-                      <th className="num">🟢 In Total</th>
-                      <th className="num">Out (Car / Bike / Auto / Amb)</th>
-                      <th className="num">🔵 Out Total</th>
+                      <th className="num">{isBasement ? 'Entry' : 'In'} (Car / Bike / Auto / Amb)</th>
+                      <th className="num">{isBasement ? '🟠 Entry Total' : '🟢 In Total'}</th>
+                      <th className="num">{isBasement ? 'Exit' : 'Out'} (Car / Bike / Auto / Amb)</th>
+                      <th className="num">{isBasement ? '🟡 Exit Total' : '🔵 Out Total'}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -1864,9 +2028,9 @@ function VehicleHistoryModal({ open, onClose, initialData }) {
                         <tr key={b.bucket}>
                           <td>{lbl}</td>
                           <td className="num">{i.car} / {i.bike} / {i.auto} / {i.ambulance}</td>
-                          <td className="num"><span className="vc-pill in">{i.total}</span></td>
+                          <td className="num"><span className={`vc-pill ${isBasement ? 'base-in' : 'in'}`}>{i.total}</span></td>
                           <td className="num">{o.car} / {o.bike} / {o.auto} / {o.ambulance}</td>
-                          <td className="num"><span className="vc-pill out">{o.total}</span></td>
+                          <td className="num"><span className={`vc-pill ${isBasement ? 'base-out' : 'out'}`}>{o.total}</span></td>
                         </tr>
                       );
                     })}
@@ -1874,7 +2038,9 @@ function VehicleHistoryModal({ open, onClose, initialData }) {
                 </table>
               </div>
             ) : (
-              <div className="empty" style={{ border: '1px solid #eef2f7', borderRadius: 8 }}>No historical gate vehicle records in this selected window yet.</div>
+              <div className="empty" style={{ border: '1px solid #eef2f7', borderRadius: 8 }}>
+                {isBasement ? 'No historical basement gate records in this selected window yet.' : 'No historical gate vehicle records in this selected window yet.'}
+              </div>
             )}
           </div>
 
@@ -1899,10 +2065,11 @@ function VehicleHistoryModal({ open, onClose, initialData }) {
                   <tbody>
                     {events.map(ev => {
                       const extraCams = (ev.merged_cameras && ev.merged_cameras.length > 1) ? ev.merged_cameras.length - 1 : 0;
+                      const dm = getDirectionMeta(ev.direction);
                       return (
                         <tr key={ev.id}>
                           <td style={{ whiteSpace: 'nowrap' }}>{tsDate(ev.ts)}</td>
-                          <td><span className={`vc-pill ${ev.direction === 'incoming' ? 'in' : 'out'}`}>{ev.direction.toUpperCase()}</span></td>
+                          <td><span className={`vc-pill ${dm.pill}`}>{dm.label}</span></td>
                           <td>
                             <span>{ev.camera}</span>
                             {extraCams > 0 && (
@@ -2787,7 +2954,7 @@ function App() {
     return d.toISOString().slice(0, 16);
   });
   const [vcCustomEnd, setVcCustomEnd] = useState(() => new Date().toISOString().slice(0, 16));
-  const [historyModalOpen, setHistoryModalOpen] = useState(false);
+  const [historyScope, setHistoryScope] = useState(null);
   const [ambulanceData, setAmbulanceData] = useState(null);
   const [ambHours, setAmbHours] = useState('24');
   const [dispatchAmbulance, setDispatchAmbulance] = useState(null);
@@ -3113,6 +3280,7 @@ function App() {
       <div className="kpis">
         <KpiCard label="VEHICLES TODAY" value={analytics?.vehicles_today ?? '—'} sub="Unique plate entries" color="var(--teal)" />
         <KpiCard label="ON SITE NOW" value={analytics?.on_site ?? '—'} sub="Currently in premises" color="var(--blue)" />
+        <BasementInKpiCard vehicleCounts={vehicleCounts} />
         <KpiCard label="UNIQUE PLATES" value={analytics?.unique_plates ?? '—'} sub={analytics?.hours ? `In last ${analytics.hours}h window` : 'In selected window'} color="var(--purple)" />
         <KpiCard label="AVG DWELL TIME" value={analytics?.avg_dwell_ms ? dwell(analytics.avg_dwell_ms) : '—'} sub="Entry to exit average" color="var(--gold)" />
       </div>
@@ -3212,8 +3380,16 @@ function App() {
 
       {/* ── Main Content Grid ── */}
       <div className="grid">
-        {/* Left: Journeys (with pagination & smart filtering) + Gate Analytics + Remaining Live Cameras */}
+        {/* Left: Gate Checkpoints + Journeys + Inflow Volume Timeline + Remaining Live Cameras */}
         <div className="span8" style={{ display: 'grid', gap: 16, alignContent: 'start' }}>
+          {/* ── Gate Traffic & Camera Flow Analysis Card (Checkpoints) ── */}
+          <GateAnalyticsCard
+            analytics={analytics}
+            devices={devices}
+            timeFilter={timeFilter}
+            setTimeFilter={setTimeFilter}
+          />
+
           {/* Journey Table Card */}
           <div className="card">
             {/* Header: Title & Download Filtered List Button */}
@@ -3522,12 +3698,10 @@ function App() {
             </div>
           </div>
 
-          {/* ── Gate Traffic & Flow Analysis Card ── */}
-          <GateAnalyticsCard
+          {/* ── Inflow Volume Timeline Card ── */}
+          <InflowVolumeTimelineCard
             analytics={analytics}
-            devices={devices}
             timeFilter={timeFilter}
-            setTimeFilter={setTimeFilter}
           />
 
           {/* ── Remaining Cameras — Live Only (Never Saved to DB) ── */}
@@ -3601,7 +3775,7 @@ function App() {
             setCustomStart={setVcCustomStart}
             customEnd={vcCustomEnd}
             setCustomEnd={setVcCustomEnd}
-            onOpenHistory={() => setHistoryModalOpen(true)}
+            onOpenHistory={(scope) => setHistoryScope(scope || 'main')}
           />
         </div>
       </div>
@@ -3623,8 +3797,9 @@ function App() {
         onDispatched={() => loadState()}
       />
       <VehicleHistoryModal
-        open={historyModalOpen}
-        onClose={() => setHistoryModalOpen(false)}
+        open={!!historyScope}
+        scope={historyScope || 'main'}
+        onClose={() => setHistoryScope(null)}
         initialData={vehicleCounts}
       />
       <FullscreenModal
