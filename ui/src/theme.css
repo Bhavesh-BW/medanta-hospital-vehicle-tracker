@@ -1392,3 +1392,71 @@ table.tbl {
   font-weight: 700;
   color: #94a3b8
 }
+
+/* ── Filter & Async Loading UI ────────────────────────── */
+@keyframes agySpin {
+  to {
+    transform: rotate(360deg)
+  }
+}
+
+.spin-ring {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: agySpin .7s linear infinite;
+  flex-shrink: 0
+}
+
+.spin-ring.lg {
+  width: 22px;
+  height: 22px;
+  border-width: 2.5px;
+  color: var(--teal)
+}
+
+.loading-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: #e6f4f2;
+  border: 1px solid #bfe3dd;
+  color: #176c66;
+  font-size: 10px;
+  font-weight: 800
+}
+
+.loading-wrap {
+  position: relative
+}
+
+.loading-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(255, 255, 255, .72);
+  backdrop-filter: blur(2px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 15;
+  padding: 16px
+}
+
+.loading-box {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 16px;
+  border-radius: 12px;
+  background: #fff;
+  border: 1px solid #dbe4f0;
+  box-shadow: 0 10px 24px -10px rgba(23, 33, 56, .25);
+  font-size: 12px;
+  font-weight: 700;
+  color: #1e293b
+}
