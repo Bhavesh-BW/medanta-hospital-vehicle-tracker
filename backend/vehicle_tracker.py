@@ -10,6 +10,7 @@ Auth: X-Local-Vision-Key header, same shared key as the other vision services.
 """
 import base64
 import collections
+import gzip
 import hmac
 import html
 import json
@@ -142,7 +143,23 @@ def to_ist_strftime(epoch_sec=None, fmt='%Y-%m-%d %H:%M:%S'):
     sec = epoch_sec if epoch_sec is not None else time.time()
     return time.strftime(fmt, time.gmtime(sec + IST_OFFSET_SEC))
 
-def _parse_window_bounds(query, default_hours='24', allow_all=False):
+def _resolve_win_spec(win_spec):
+    """Resolve semantic window specification to live (from_ts, to_ts, has_to) bounds."""
+    now_ms = int(time.time() * 1000)
+    kind = win_spec[0]
+    if kind == 'custom':
+        _, f_ts, t_ts = win_spec
+        return f_ts, (t_ts if t_ts is not None else now_ms), (t_ts is not None)
+    if kind == 'all':
+        return 0, now_ms, False
+    if kind == 'today':
+        now_sec = int(time.time())
+        seconds_today_in_ist = (now_sec + IST_OFFSET_SEC) % 86400
+        return (now_sec - seconds_today_in_ist) * 1000, now_ms, False
+    hours_val = float(win_spec[1])
+    return int(now_ms - hours_val * 3600000), now_ms, False
+
+def _parse_window_with_key(query, default_hours='24', allow_all=False):
     now_ms = int(time.time() * 1000)
     from_q = query.get('from_ts', [None])[0]
     to_q = query.get('to_ts', [None])[0]
@@ -151,21 +168,34 @@ def _parse_window_bounds(query, default_hours='24', allow_all=False):
         from_ts = max(0, int(float(from_q)))
         to_ts = int(float(to_q)) if to_q is not None else now_ms
         has_to = to_q is not None
+        to_bucket = to_ts if has_to else (now_ms // 10000 * 10000)
+        win_spec = ('custom', from_ts, to_bucket if has_to else None)
+        is_heavy_win = (to_ts - from_ts) > 48 * 3600000
     elif allow_all and str(hours_q).lower() in ('all', '0'):
         from_ts = 0
         to_ts = now_ms
         has_to = False
+        win_spec = ('all',)
+        is_heavy_win = True
     elif str(hours_q).lower() == 'today':
         now_sec = int(time.time())
         seconds_today_in_ist = (now_sec + IST_OFFSET_SEC) % 86400
         from_ts = (now_sec - seconds_today_in_ist) * 1000
         to_ts = now_ms
         has_to = False
+        win_spec = ('today',)
+        is_heavy_win = False
     else:
         hours_val = min(720.0, max(0.25, float(hours_q)))
         from_ts = int(now_ms - hours_val * 3600000)
         to_ts = now_ms
         has_to = False
+        win_spec = ('hours', round(hours_val, 4))
+        is_heavy_win = hours_val >= 48.0
+    return from_ts, to_ts, has_to, win_spec, is_heavy_win
+
+def _parse_window_bounds(query, default_hours='24', allow_all=False):
+    from_ts, to_ts, has_to, _, _ = _parse_window_with_key(query, default_hours=default_hours, allow_all=allow_all)
     return from_ts, to_ts, has_to
 STREAM_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]{0,40}$')
 ROLES = ('entry', 'exit', 'basement_entry', 'basement_exit', 'basement', 'porch', 'emergency', 'checkpoint')
@@ -409,6 +439,38 @@ def _levenshtein_le_one(a, b):
                 return False
             j += 1
     return True
+
+_CLEAN_PLATE_RE = re.compile(r'[^A-Z0-9]')
+
+def _fast_confusable_1edit(na, nb):
+    """Compare two already normalized confusable-translated plate keys allowing <= 1 edit."""
+    if na == nb:
+        return True
+    la, lb = len(na), len(nb)
+    if min(la, lb) < 7:
+        return False
+    if la == lb:
+        return sum(1 for x, y in zip(na, nb) if x != y) <= 1
+    if abs(la - lb) == 1 and (na[-3:] == nb[-3:] or na[:4] == nb[:4]):
+        return _levenshtein_le_one(na, nb)
+    return False
+
+def _matches_plate_filter(visit_plates, chosen_plate, norm_filter, conf_filter):
+    """Match full, confusable, or partial substring plate searches cleanly."""
+    if not norm_filter:
+        return True
+    cands = list(visit_plates)
+    if chosen_plate and chosen_plate not in visit_plates:
+        cands.append(chosen_plate)
+    for vp in cands:
+        clean_vp = _CLEAN_PLATE_RE.sub('', str(vp or '').upper())
+        if not clean_vp:
+            continue
+        if norm_filter in clean_vp or conf_filter in clean_vp.translate(_VC_CONFUSABLE):
+            return True
+        if len(norm_filter) >= 7 and are_plates_similar_vc(clean_vp, norm_filter, allow_single_edit=False):
+            return True
+    return False
 
 def are_plates_similar_vc(p1, p2, allow_single_edit=False):
     """Compare plates tolerating OCR confusables and optional 1-char edit distance."""
@@ -1008,7 +1070,26 @@ class Store:
         pathlib.Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.execute('PRAGMA journal_mode=WAL')
+        for _pragma in (
+            'PRAGMA synchronous=NORMAL',
+            'PRAGMA temp_store=MEMORY',
+            'PRAGMA cache_size=-32768',
+            'PRAGMA mmap_size=268435456',
+            'PRAGMA busy_timeout=30000',
+        ):
+            try:
+                self.db.execute(_pragma)
+            except Exception:
+                pass
         self.lock = threading.RLock()
+        self._cache_lock = threading.Lock()
+        self._versions = {'meta': 0, 'sightings': 0, 'vc': 0, 'amb': 0}
+        self._cache = {}
+        self._inflight = {}
+        self._devices_cache = None
+        self._rules_cache = None
+        self._sightings_cols = None
+        self._devices_cols = None
         with self.lock:
             self.db.executescript('''
                 CREATE TABLE IF NOT EXISTS devices(stream TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL, anpr INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, url TEXT DEFAULT '', masks TEXT DEFAULT '[]', enabled INTEGER NOT NULL DEFAULT 1, gate_group TEXT DEFAULT '', count_enabled INTEGER NOT NULL DEFAULT 1);
@@ -1021,6 +1102,7 @@ class Store:
                 CREATE INDEX IF NOT EXISTS vc_dir_ts ON vehicle_counts(direction, ts);
                 CREATE INDEX IF NOT EXISTS vc_stream_ts ON vehicle_counts(stream, ts);
                 CREATE INDEX IF NOT EXISTS vc_plate_dir ON vehicle_counts(plate, direction, ts);
+                CREATE INDEX IF NOT EXISTS vc_ts ON vehicle_counts(ts);
                 CREATE TABLE IF NOT EXISTS ambulance_dispatches(id TEXT PRIMARY KEY, ref_id TEXT, plate TEXT, recipients TEXT NOT NULL, subject TEXT NOT NULL, note TEXT DEFAULT '', message_id TEXT DEFAULT '', ts INTEGER NOT NULL);
                 CREATE INDEX IF NOT EXISTS amb_disp_ts ON ambulance_dispatches(ts);
                 CREATE INDEX IF NOT EXISTS amb_disp_ref ON ambulance_dispatches(ref_id, ts);
@@ -1044,6 +1126,14 @@ class Store:
                 self.db.execute("CREATE INDEX IF NOT EXISTS vc_dir_grp_ts ON vehicle_counts(direction, gate_group, ts)")
             except Exception:
                 pass
+            try:
+                self.db.execute(
+                    "CREATE INDEX IF NOT EXISTS sight_ts_meta ON sightings(ts, stream, plate, confidence, vehicle_type, (photo IS NOT NULL), (plate_photo IS NOT NULL))"
+                )
+            except Exception:
+                pass
+            self._devices_cols = [r[1] for r in self.db.execute('PRAGMA table_info(devices)').fetchall()]
+            self._sightings_cols = [r[1] for r in self.db.execute('PRAGMA table_info(sightings)').fetchall()]
             self.db.commit()
             try:
                 states_sql = "','".join(s.upper() for s in INDIAN_STATES)
@@ -1060,6 +1150,99 @@ class Store:
                         self.add_device(d['stream'], d['name'], d['role'], d['anpr'], d['url'])
             except Exception as e:
                 print("Default devices seed note:", e)
+    def _bump_version(self, *keys):
+        with self._cache_lock:
+            for k in keys:
+                self._versions[k] = self._versions.get(k, 0) + 1
+            if 'meta' in keys:
+                self._devices_cache = None
+                self._rules_cache = None
+    def _ver_snapshot(self, *keys):
+        with self._cache_lock:
+            return tuple(self._versions.get(k, 0) for k in keys)
+    def _cached_fetch(self, cache_key, ver_keys, compute_fn, max_age_on_clean=6.0, min_fresh_on_dirty=0.0, swr_max_age=0.0, force_refresh=False):
+        """Thread-safe RAM cache with singleflight coalescing and optional stale-while-revalidate."""
+        now_mono = time.monotonic()
+        cur_ver = self._ver_snapshot(*ver_keys)
+        if not force_refresh:
+            with self._cache_lock:
+                entry = self._cache.get(cache_key)
+                if entry is not None:
+                    age = now_mono - entry['ts']
+                    meta_ok = (entry['ver'][0] == cur_ver[0]) if cur_ver else True
+                    if entry['ver'] == cur_ver and age <= max_age_on_clean:
+                        return entry['val']
+                    if meta_ok and entry.get('heavy'):
+                        if min_fresh_on_dirty > 0 and age <= min_fresh_on_dirty:
+                            return entry['val']
+                        if swr_max_age > 0 and age <= swr_max_age:
+                            if not entry.get('refreshing'):
+                                entry['refreshing'] = True
+                                def _bg_refresh():
+                                    try:
+                                        val = compute_fn()
+                                        v_now = self._ver_snapshot(*ver_keys)
+                                        with self._cache_lock:
+                                            self._cache[cache_key] = {
+                                                'ver': v_now,
+                                                'ts': time.monotonic(),
+                                                'val': val,
+                                                'heavy': entry.get('heavy', True),
+                                                'refreshing': False,
+                                            }
+                                    except Exception:
+                                        with self._cache_lock:
+                                            cur_e = self._cache.get(cache_key)
+                                            if cur_e:
+                                                cur_e['refreshing'] = False
+                                threading.Thread(target=_bg_refresh, daemon=True).start()
+                            return entry['val']
+
+        leader = False
+        wait_ev = None
+        with self._cache_lock:
+            inflight = self._inflight.get(cache_key)
+            if inflight is None:
+                wait_ev = threading.Event()
+                self._inflight[cache_key] = wait_ev
+                leader = True
+            else:
+                wait_ev = inflight
+
+        if not leader:
+            wait_ev.wait(timeout=45.0)
+            with self._cache_lock:
+                entry = self._cache.get(cache_key)
+                if entry is not None:
+                    return entry['val']
+            return compute_fn()
+
+        try:
+            v_start = self._ver_snapshot(*ver_keys)
+            val = compute_fn()
+            v_end = self._ver_snapshot(*ver_keys)
+            heavy = False
+            if isinstance(val, dict):
+                if val.get('_heavy') or val.get('count', 0) >= 500:
+                    heavy = True
+            elif isinstance(val, list) and len(val) >= 500:
+                heavy = True
+            with self._cache_lock:
+                if len(self._cache) >= 64:
+                    oldest_key = min(self._cache.items(), key=lambda kv: kv[1]['ts'])[0]
+                    self._cache.pop(oldest_key, None)
+                self._cache[cache_key] = {
+                    'ver': v_end if v_end == v_start else v_start,
+                    'ts': time.monotonic(),
+                    'val': val,
+                    'heavy': heavy,
+                    'refreshing': False,
+                }
+            return val
+        finally:
+            with self._cache_lock:
+                self._inflight.pop(cache_key, None)
+                wait_ev.set()
     def setting(self, key, fallback=None):
         with self.lock:
             row = self.db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
@@ -1068,16 +1251,23 @@ class Store:
         with self.lock:
             self.db.execute('INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, str(value)))
             self.db.commit()
+        self._bump_version('meta')
     def rules(self):
+        with self._cache_lock:
+            if self._rules_cache is not None:
+                return dict(self._rules_cache)
         try:
             rules = json.loads(self.setting('rules', '{}'))
         except Exception:
             rules = {}
-        return {'visit_gap_min': min(1440, max(1, int(rules.get('visit_gap_min', 30)))),
+        parsed = {'visit_gap_min': min(1440, max(1, int(rules.get('visit_gap_min', 30)))),
                 'exit_grace_min': min(1440, max(1, int(rules.get('exit_grace_min', 45)))),
                 'correlate_passages': bool(rules.get('correlate_passages', True)),
                 'correlate_window_s': min(3600, max(30, int(rules.get('correlate_window_s', 300)))),
                 'gate_dedup_s': min(120, max(0, int(rules.get('gate_dedup_s', 15))))}
+        with self._cache_lock:
+            self._rules_cache = dict(parsed)
+        return dict(parsed)
     def save_rules(self, body):
         rules = self.rules()
         limits = {'visit_gap_min': (1, 1440), 'exit_grace_min': (1, 1440), 'correlate_window_s': (30, 3600), 'gate_dedup_s': (0, 120)}
@@ -1092,8 +1282,12 @@ class Store:
         self.set_setting('rules', json.dumps(rules))
         return self.rules()
     def devices(self):
+        with self._cache_lock:
+            if self._devices_cache is not None:
+                return [dict(d) for d in self._devices_cache]
         with self.lock:
-            cols = [r[1] for r in self.db.execute('PRAGMA table_info(devices)').fetchall()]
+            cols = self._devices_cols or [r[1] for r in self.db.execute('PRAGMA table_info(devices)').fetchall()]
+            self._devices_cols = cols
             rows = self.db.execute(f"SELECT {','.join(cols)} FROM devices ORDER BY created_at").fetchall()
         result = []
         for r in rows:
@@ -1111,6 +1305,8 @@ class Store:
             d['gate_group'] = normalize_gate_group(d.get('gate_group', ''), display=True)
             d['count_enabled'] = bool(d.get('count_enabled', 1))
             result.append(d)
+        with self._cache_lock:
+            self._devices_cache = [dict(d) for d in result]
         return result
     def add_device(self, stream, name, role, anpr=True, url='', masks=None, enabled=True, gate_group='', count_enabled=True):
         url = str(url or '').strip()
@@ -1128,7 +1324,8 @@ class Store:
         masks_json = json.dumps(masks or [])
         clean_group = normalize_gate_group(gate_group, display=True)
         with self.lock:
-            cols = [r[1] for r in self.db.execute('PRAGMA table_info(devices)').fetchall()]
+            cols = self._devices_cols or [r[1] for r in self.db.execute('PRAGMA table_info(devices)').fetchall()]
+            self._devices_cols = cols
             data_map = {
                 'stream': stream,
                 'name': name,
@@ -1154,30 +1351,34 @@ class Store:
             values = [data_map[c] for c in active_cols]
             self.db.execute(sql, values)
             self.db.commit()
+        self._bump_version('meta')
         return [d for d in self.devices() if d['stream'] == stream][0]
     def remove_device(self, stream):
         with self.lock:
             if not self.db.execute('DELETE FROM devices WHERE stream=?', (stream,)).rowcount:
                 raise ValueError('Unknown device')
             self.db.commit()
+        self._bump_version('meta')
     def save_sighting(self, stream, plate, confidence, ts, photo=None, plate_photo=None, vehicle_type='car'):
         sid = uuid.uuid4().hex
         vtype = normalize_vehicle_type(vehicle_type)
         with self.lock:
-            cols = [r[1] for r in self.db.execute('PRAGMA table_info(sightings)').fetchall()]
+            cols = self._sightings_cols or [r[1] for r in self.db.execute('PRAGMA table_info(sightings)').fetchall()]
+            self._sightings_cols = cols
             data_map = {'id': sid, 'stream': stream, 'plate': plate, 'confidence': confidence, 'ts': ts, 'photo': photo, 'plate_photo': plate_photo, 'verified': 0, 'vehicle_type': vtype}
             active_cols = [c for c in cols if c in data_map]
             placeholders = ','.join(['?'] * len(active_cols))
             self.db.execute(f"INSERT INTO sightings({','.join(active_cols)}) VALUES({placeholders})", [data_map[c] for c in active_cols])
             self.db.execute('DELETE FROM sightings WHERE ts<?', (ts - 30 * 86400000,))
             self.db.commit()
+        self._bump_version('sightings')
         return sid
     def update_sighting(self, sid, plate=None, vehicle_type=None, confidence=None):
         """Refine an already-saved sighting in place when multi-frame voting improves plate or type."""
         if not sid:
             return
         with self.lock:
-            cols = {r[1] for r in self.db.execute('PRAGMA table_info(sightings)').fetchall()}
+            cols = set(self._sightings_cols or [r[1] for r in self.db.execute('PRAGMA table_info(sightings)').fetchall()])
             updates, params = [], []
             if plate:
                 updates.append('plate=?')
@@ -1193,13 +1394,20 @@ class Store:
             params.append(sid)
             self.db.execute(f"UPDATE sightings SET {','.join(updates)} WHERE id=?", params)
             self.db.commit()
-    def sightings(self, since=0, plate=None, limit=500):
-        with self.lock:
-            cols = [r[1] for r in self.db.execute('PRAGMA table_info(sightings)').fetchall()]
+        self._bump_version('sightings')
+    def sightings(self, since=0, plate=None, limit=500, to_ts=None):
+        cols = self._sightings_cols
+        if not cols:
+            with self.lock:
+                cols = [r[1] for r in self.db.execute('PRAGMA table_info(sightings)').fetchall()]
+                self._sightings_cols = cols
         has_vtype = 'vehicle_type' in cols
         vtype_sel = ',vehicle_type' if has_vtype else ''
         query = f'SELECT id,stream,plate,confidence,ts,(photo IS NOT NULL),(plate_photo IS NOT NULL){vtype_sel} FROM sightings WHERE ts>=?'
         params = [since]
+        if to_ts is not None:
+            query += ' AND ts<=?'
+            params.append(int(to_ts))
         if plate:
             query += ' AND plate=?'
             params.append(plate.upper())
@@ -1269,6 +1477,7 @@ class Store:
             (new_vtype, new_plate, new_conf, merged, row_id)
         )
         self.db.commit()
+        self._bump_version('vc')
         return row_id
     @staticmethod
     def _norm_plate(plate):
@@ -1353,6 +1562,7 @@ class Store:
                 (eid, stream, direction, vtype, clean_plate, track_id, conf_val, ts_val, norm_grp, stream)
             )
             self.db.commit()
+        self._bump_version('vc')
         return eid, False
     def update_vehicle_count(self, row_id, vehicle_type=None, plate=None, dedup_gap_ms=1800000, gate_dedup_ms=15000, confidence=None, coactive_plates=None):
         """Refine vehicle type or attach/consensus-update ANPR plate (merging duplicate rows cleanly)."""
@@ -1416,6 +1626,7 @@ class Store:
                     )
                     self.db.execute('DELETE FROM vehicle_counts WHERE id=?', (row_id,))
                     self.db.commit()
+                    self._bump_version('vc')
                     return other[0]
             new_conf = max(cur_conf_f, cand_conf_f)
             self.db.execute(
@@ -1423,6 +1634,7 @@ class Store:
                 (new_vtype, clean_plate, new_conf, ','.join(cur_streams), row_id)
             )
             self.db.commit()
+        self._bump_version('vc')
         return row_id
     @staticmethod
     def _empty_vtype_bucket():
@@ -1444,6 +1656,12 @@ class Store:
         end_ts = int(to_ts) if to_ts is not None else int(time.time() * 1000)
         start_ts = max(0, int(from_ts or 0))
         devices = {d['stream']: d for d in self.devices()}
+        if granularity in ('hourly', 'daily'):
+            is_daily = (granularity == 'daily')
+        else:
+            is_daily = (start_ts > 0 and (end_ts - start_ts) > 48 * 3600000) or (start_ts == 0)
+        bucket_ms = 86400000 if is_daily else 3600000
+
         ev_sql = (
             "SELECT id, stream, direction, vehicle_type, plate, confidence, ts, COALESCE(gate_group,''), COALESCE(merged_streams,'') "
             "FROM vehicle_counts WHERE ts>=? AND ts<=?"
@@ -1456,6 +1674,14 @@ class Store:
         ev_sql += ' ORDER BY ts DESC LIMIT ?'
         ev_params.append(max(1, int(event_limit)))
 
+        all_time_cached = self._cached_fetch(
+            'vc_all_time',
+            ('meta', 'vc'),
+            lambda: self._load_vc_all_time_stats(),
+            max_age_on_clean=15.0,
+            min_fresh_on_dirty=0.0,
+        )
+
         with self.lock:
             agg_rows = self.db.execute(
                 'SELECT direction, vehicle_type, COUNT(*) FROM vehicle_counts WHERE ts>=? AND ts<=? GROUP BY direction, vehicle_type',
@@ -1465,15 +1691,12 @@ class Store:
                 'SELECT stream, direction, vehicle_type, COUNT(*) FROM vehicle_counts WHERE ts>=? AND ts<=? GROUP BY stream, direction, vehicle_type',
                 (start_ts, end_ts)
             ).fetchall()
-            raw_hist = self.db.execute(
-                'SELECT direction, vehicle_type, ts FROM vehicle_counts WHERE ts>=? AND ts<=? ORDER BY ts',
-                (start_ts, end_ts)
+            hist_rows = self.db.execute(
+                'SELECT ((CAST(ts AS INTEGER) + ?) / ? * ? - ?) AS b_ts, direction, vehicle_type, COUNT(*) '
+                'FROM vehicle_counts WHERE ts>=? AND ts<=? GROUP BY b_ts, direction, vehicle_type ORDER BY b_ts',
+                (IST_OFFSET_MS, bucket_ms, bucket_ms, IST_OFFSET_MS, start_ts, end_ts)
             ).fetchall()
             event_rows = self.db.execute(ev_sql, ev_params).fetchall()
-            all_rows = self.db.execute(
-                'SELECT direction, vehicle_type, COUNT(*) FROM vehicle_counts GROUP BY direction, vehicle_type'
-            ).fetchall()
-            bounds = self.db.execute('SELECT MIN(ts), MAX(ts) FROM vehicle_counts').fetchone()
 
         agg_buckets = {d: self._empty_vtype_bucket() for d in GATE_DIRECTIONS}
         for dir_key, vtype, cnt in agg_rows:
@@ -1482,13 +1705,8 @@ class Store:
                 agg_buckets[dir_key][vt] += int(cnt)
                 agg_buckets[dir_key]['total'] += int(cnt)
 
-        all_buckets = {d: self._empty_vtype_bucket() for d in GATE_DIRECTIONS}
-        for dir_key, vtype, cnt in all_rows:
-            if dir_key in all_buckets:
-                vt = normalize_vehicle_type(vtype)
-                all_buckets[dir_key][vt] += int(cnt)
-                all_buckets[dir_key]['total'] += int(cnt)
-
+        all_buckets = all_time_cached['buckets']
+        bounds = all_time_cached['bounds']
         incoming = agg_buckets['incoming']
         outgoing = agg_buckets['outgoing']
         all_in = all_buckets['incoming']
@@ -1511,14 +1729,9 @@ class Store:
             cam_map[key][vt] += int(cnt)
             cam_map[key]['total'] += int(cnt)
 
-        if granularity in ('hourly', 'daily'):
-            is_daily = (granularity == 'daily')
-        else:
-            is_daily = (start_ts > 0 and (end_ts - start_ts) > 48 * 3600000) or (start_ts == 0)
-        bucket_ms = 86400000 if is_daily else 3600000
         hist_buckets = {}
         basement_hist_buckets = {}
-        for dir_key, vtype, ts_val in raw_hist:
+        for b_ts, dir_key, vtype, cnt in hist_rows:
             if dir_key in ('incoming', 'outgoing'):
                 target_map, side_key = hist_buckets, dir_key
             elif dir_key in ('basement_incoming', 'basement_outgoing'):
@@ -1527,15 +1740,16 @@ class Store:
             else:
                 continue
             vt = normalize_vehicle_type(vtype)
-            b_ts = (int(ts_val) + IST_OFFSET_MS) // bucket_ms * bucket_ms - IST_OFFSET_MS
-            slot = target_map.setdefault(b_ts, {
-                'bucket': b_ts,
+            b_ts_int = int(b_ts)
+            slot = target_map.setdefault(b_ts_int, {
+                'bucket': b_ts_int,
                 'incoming': self._empty_vtype_bucket(),
                 'outgoing': self._empty_vtype_bucket()
             })
             side = slot[side_key]
-            side[vt] += 1
-            side['total'] += 1
+            c_int = int(cnt)
+            side[vt] += c_int
+            side['total'] += c_int
 
         recent_events = []
         for r in event_rows:
@@ -1579,6 +1793,19 @@ class Store:
                 'latest_ts': bounds[1] if bounds else None
             }
         }
+    def _load_vc_all_time_stats(self):
+        with self.lock:
+            all_rows = self.db.execute(
+                'SELECT direction, vehicle_type, COUNT(*) FROM vehicle_counts GROUP BY direction, vehicle_type'
+            ).fetchall()
+            bounds = self.db.execute('SELECT MIN(ts), MAX(ts) FROM vehicle_counts').fetchone()
+        all_buckets = {d: self._empty_vtype_bucket() for d in GATE_DIRECTIONS}
+        for dir_key, vtype, cnt in all_rows:
+            if dir_key in all_buckets:
+                vt = normalize_vehicle_type(vtype)
+                all_buckets[dir_key][vt] += int(cnt)
+                all_buckets[dir_key]['total'] += int(cnt)
+        return {'buckets': all_buckets, 'bounds': bounds}
     def vehicle_counts_events(self, from_ts=0, to_ts=None, direction=None, vehicle_type=None, limit=5000):
         end_ts = int(to_ts) if to_ts is not None else int(time.time() * 1000)
         start_ts = max(0, int(from_ts or 0))
@@ -1633,26 +1860,30 @@ def _pick_journey_vtype(reads):
         return max(non_amb, key=lambda x: x[1])[0]
     return max(weights.items(), key=lambda x: x[1])[0]
 
-def journeys(store, since_ms, plate_filter=None):
+def journeys(store, since_ms, plate_filter=None, to_ts=None, limit=50000):
     """Cluster plate sightings into visits tolerating OCR confusables and single-char passage jitter."""
     rules = store.rules()
     gap_ms = rules['visit_gap_min'] * 60000
     grace_ms = rules['exit_grace_min'] * 60000
     devices = {d['stream']: d for d in store.devices()}
-    # Load window sightings (fetch unfiltered when plate_filter given so 1-char variants cluster before filtering)
-    rows = store.sightings(since=since_ms, plate=None, limit=20000)
+    # Load window sightings unfiltered so 1-char OCR variants cluster before plate filtering
+    rows = store.sightings(since=since_ms, plate=None, limit=limit, to_ts=to_ts)
     now_ms = int(time.time() * 1000)
 
     visits = []
-    # Index clusters by normalized confusable key for O(1) exact/confusable matching
+    # Index active visits by normalized confusable key + 3-char prefix/suffix for fast lookup
     exact_buckets = collections.defaultdict(list)
+    p3_buckets = collections.defaultdict(list)
+    s3_buckets = collections.defaultdict(list)
     for read in rows:
         plate = str(read.get('plate') or '').upper()
         if not plate:
             continue
-        conf_key = re.sub(r'[^A-Z0-9]', '', plate).translate(_VC_CONFUSABLE)
+        clean_p = _CLEAN_PLATE_RE.sub('', plate)
+        conf_key = clean_p.translate(_VC_CONFUSABLE)
         ts = int(read['ts'])
-        dev = devices.get(read['stream'], {})
+        stream = read['stream']
+        dev = devices.get(stream, {})
         role = dev.get('role', 'checkpoint')
 
         matched_visit = None
@@ -1661,27 +1892,48 @@ def journeys(store, since_ms, plate_filter=None):
                 matched_visit = v
                 break
 
-        if matched_visit is None:
-            # Fallback: short-window same-camera (<= 25s) or cross-camera open-visit 1-edit match
-            for v in reversed(visits):
-                dt = ts - v['last_ts']
-                if dt > gap_ms:
-                    break
-                if not any(are_plates_similar_vc(vp, plate, allow_single_edit=True) for vp in v['plates']):
-                    continue
-                same_stream_jitter = (read['stream'] == v['last_stream'] and dt <= 25000)
-                cross_cam_visit = (read['stream'] != v['last_stream'] and dt <= grace_ms and v['last_role'] != 'exit')
-                if same_stream_jitter or cross_cam_visit:
-                    matched_visit = v
-                    break
+        if matched_visit is None and len(conf_key) >= 7:
+            # Pigeonhole candidate set: any 1-edit match of len >= 7 shares prefix[:3] or suffix[-3:]
+            p3_k = conf_key[:3]
+            s3_k = conf_key[-3:]
+            p3_list = p3_buckets.get(p3_k)
+            s3_list = s3_buckets.get(s3_k)
+            if p3_list and len(p3_list) > 24:
+                p3_list = [v for v in p3_list if ts - v['last_ts'] <= gap_ms]
+                p3_buckets[p3_k] = p3_list
+            if s3_list and len(s3_list) > 24:
+                s3_list = [v for v in s3_list if ts - v['last_ts'] <= gap_ms]
+                s3_buckets[s3_k] = s3_list
+            cands = {}
+            if p3_list:
+                for v in p3_list:
+                    if ts - v['last_ts'] <= gap_ms:
+                        cands[v['_idx']] = v
+            if s3_list:
+                for v in s3_list:
+                    if ts - v['last_ts'] <= gap_ms:
+                        cands[v['_idx']] = v
+            if cands:
+                for _, v in sorted(cands.items(), key=lambda kv: kv[0], reverse=True):
+                    dt = ts - v['last_ts']
+                    same_stream_jitter = (stream == v['last_stream'] and dt <= 25000)
+                    cross_cam_visit = (stream != v['last_stream'] and dt <= grace_ms and v['last_role'] != 'exit')
+                    if not (same_stream_jitter or cross_cam_visit):
+                        continue
+                    if any(_fast_confusable_1edit(vp_conf, conf_key) for vp_conf in v['conf_keys']):
+                        matched_visit = v
+                        break
 
         if matched_visit is None:
             matched_visit = {
+                '_idx': len(visits),
                 'reads': [],
                 'plates': set(),
                 'conf_keys': set(),
+                'p3_keys': set(),
+                's3_keys': set(),
                 'last_ts': ts,
-                'last_stream': read['stream'],
+                'last_stream': stream,
                 'last_role': role
             }
             visits.append(matched_visit)
@@ -1689,20 +1941,27 @@ def journeys(store, since_ms, plate_filter=None):
         matched_visit['reads'].append(read)
         matched_visit['plates'].add(plate)
         matched_visit['last_ts'] = ts
-        matched_visit['last_stream'] = read['stream']
+        matched_visit['last_stream'] = stream
         matched_visit['last_role'] = role
         if conf_key not in matched_visit['conf_keys']:
             matched_visit['conf_keys'].add(conf_key)
             exact_buckets[conf_key].append(matched_visit)
+            if len(conf_key) >= 7:
+                pk, sk = conf_key[:3], conf_key[-3:]
+                if pk not in matched_visit['p3_keys']:
+                    matched_visit['p3_keys'].add(pk)
+                    p3_buckets[pk].append(matched_visit)
+                if sk not in matched_visit['s3_keys']:
+                    matched_visit['s3_keys'].add(sk)
+                    s3_buckets[sk].append(matched_visit)
 
     out = []
-    norm_filter = plate_filter.strip().upper() if plate_filter else None
+    norm_filter = _CLEAN_PLATE_RE.sub('', plate_filter.strip().upper()) if plate_filter else None
+    conf_filter = norm_filter.translate(_VC_CONFUSABLE) if norm_filter else None
     for visit in visits:
         reads_v = visit['reads']
         plate = _pick_journey_plate(reads_v)
-        if norm_filter and norm_filter not in visit['plates'] and not any(
-            are_plates_similar_vc(vp, norm_filter, allow_single_edit=False) for vp in visit['plates']
-        ):
+        if norm_filter and not _matches_plate_filter(visit['plates'], plate, norm_filter, conf_filter):
             continue
         first, last = reads_v[0], reads_v[-1]
         cameras = []
@@ -1760,6 +2019,74 @@ def journeys(store, since_ms, plate_filter=None):
     out.sort(key=lambda v: v['first_at'], reverse=True)
     return out
 
+def _cached_window_journeys(store, win_spec, is_heavy_win=False, fresh=False):
+    """Fetch unfiltered journeys for a semantic window using Store RAM cache & singleflight."""
+    def _compute():
+        since_ms, to_ms, has_to = _resolve_win_spec(win_spec)
+        return journeys(store, since_ms, plate_filter=None, to_ts=to_ms if has_to else None, limit=50000)
+    if is_heavy_win:
+        return store._cached_fetch(
+            ('journeys_base', win_spec),
+            ('meta', 'sightings'),
+            _compute,
+            max_age_on_clean=15.0,
+            min_fresh_on_dirty=12.0,
+            swr_max_age=30.0,
+            force_refresh=fresh,
+        )
+    return store._cached_fetch(
+        ('journeys_base', win_spec),
+        ('meta', 'sightings'),
+        _compute,
+        max_age_on_clean=3.0,
+        min_fresh_on_dirty=2.0,
+        swr_max_age=4.0,
+        force_refresh=fresh,
+    )
+
+def _filter_journeys_list(base_visits, plate_filter=None, vtype_filter=None):
+    res = base_visits
+    if plate_filter:
+        norm_filter = _CLEAN_PLATE_RE.sub('', plate_filter.strip().upper())
+        conf_filter = norm_filter.translate(_VC_CONFUSABLE) if norm_filter else ''
+        if norm_filter:
+            res = [
+                v for v in res
+                if _matches_plate_filter([v.get('plate')], v.get('plate'), norm_filter, conf_filter)
+            ]
+    if vtype_filter and vtype_filter != 'all':
+        norm_vt = normalize_vehicle_type(vtype_filter)
+        res = [v for v in res if normalize_vehicle_type(v.get('vehicle_type')) == norm_vt]
+    return res
+
+def _compute_analytics_from_visits(visits):
+    now_sec = int(time.time())
+    seconds_today_in_ist = (now_sec + IST_OFFSET_SEC) % 86400
+    today = (now_sec - seconds_today_in_ist) * 1000
+    dwell = [v['dwell_ms'] for v in visits if v['status'] == 'exited']
+    per_camera = collections.Counter()
+    hourly = collections.Counter()
+    bucket_ms = 3600000
+    for v in visits:
+        for cam in v['cameras']:
+            per_camera[cam['stream']] += cam['reads']
+        ist_bucket = (v['first_at'] + IST_OFFSET_MS) // bucket_ms * bucket_ms - IST_OFFSET_MS
+        hourly[ist_bucket] += 1
+    return {
+        'vehicles_today': sum(1 for v in visits if v['first_at'] >= today),
+        'on_site': sum(1 for v in visits if v['status'] == 'on_site'),
+        'exited': sum(1 for v in visits if v['status'] == 'exited'),
+        'unique_plates': len({v['plate'] for v in visits}),
+        'avg_dwell_ms': int(sum(dwell) / len(dwell)) if dwell else None,
+        'per_camera': dict(per_camera),
+        'hourly_entries': [{'bucket': ts, 'count': n} for ts, n in sorted(hourly.items())],
+    }
+
+def _serialize_json_bundle(data, heavy=False):
+    raw = json.dumps(data, separators=(',', ':')).encode('utf-8')
+    gz = gzip.compress(raw, compresslevel=5) if len(raw) >= 512 else None
+    return {'raw': raw, 'gz': gz, '_heavy': bool(heavy or len(raw) >= 200000)}
+
 def record_ambulance_dispatch(store, ref_id, plate, recipients, subject, note='', message_id='', ts=None):
     did = uuid.uuid4().hex
     ts_val = int(ts if ts is not None else time.time() * 1000)
@@ -1771,6 +2098,7 @@ def record_ambulance_dispatch(store, ref_id, plate, recipients, subject, note=''
             (did, ref_id or '', clean_plate, recips_str, subject, note or '', message_id or '', ts_val)
         )
         store.db.commit()
+    store._bump_version('amb')
     return {'id': did, 'ref_id': ref_id or '', 'plate': clean_plate, 'recipients': recips_str, 'subject': subject, 'note': note or '', 'message_id': message_id or '', 'ts': ts_val}
 
 def list_ambulance_dispatches(store, since_ms=0, limit=500):
@@ -1784,11 +2112,14 @@ def list_ambulance_dispatches(store, since_ms=0, limit=500):
         for r in rows
     ]
 
-def build_ambulance_list(store, hours=24, limit=200):
+def build_ambulance_list(store, hours=24, limit=200, win_spec=None, fresh=False):
     """Build unified Ambulance Registry combining plated ambulance journeys and unplated gate counts."""
-    now_ms = int(time.time() * 1000)
-    since_ms = int(now_ms - hours * 3600000)
-    amb_journeys = [v for v in journeys(store, since_ms) if v.get('vehicle_type') == 'ambulance']
+    if win_spec is None:
+        win_spec = ('hours', round(float(hours), 4))
+    since_ms, now_ms, _ = _resolve_win_spec(win_spec)
+    is_heavy = (win_spec[0] == 'hours' and float(win_spec[1]) >= 48.0)
+    base_visits = _cached_window_journeys(store, win_spec, is_heavy_win=is_heavy, fresh=fresh)
+    amb_journeys = [v for v in base_visits if v.get('vehicle_type') == 'ambulance']
     vc_events = store.vehicle_counts_events(from_ts=since_ms, to_ts=now_ms, vehicle_type='ambulance', limit=1000)
     dispatches = list_ambulance_dispatches(store, since_ms=since_ms, limit=500)
 
@@ -3005,15 +3336,37 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, DELETE, PATCH')
         self.send_header('Access-Control-Allow-Headers', '*')
         self.end_headers()
-    def send_json(self, status, data):
-        raw = json.dumps(data).encode()
+    def _send_json_bytes(self, status, raw_bytes, gz_bytes=None):
+        accept_enc = self.headers.get('Accept-Encoding', '') if self.headers else ''
+        use_gzip = ('gzip' in accept_enc.lower()) and (len(raw_bytes) >= 512)
+        if use_gzip:
+            body = gz_bytes if gz_bytes is not None else gzip.compress(raw_bytes, compresslevel=5)
+        else:
+            body = raw_bytes
         self.send_response(status)
         self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', str(len(raw)))
+        if use_gzip:
+            self.send_header('Content-Encoding', 'gzip')
+        self.send_header('Vary', 'Accept-Encoding')
+        self.send_header('Content-Length', str(len(body)))
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Cache-Control', 'no-store')
         self.end_headers()
-        self.wfile.write(raw)
+        self.wfile.write(body)
+    def send_json(self, status, data):
+        raw = json.dumps(data, separators=(',', ':')).encode('utf-8')
+        return self._send_json_bytes(status, raw)
+    def send_cached_json(self, cache_key, ver_keys, build_fn, is_heavy=False, fresh=False):
+        bundle = self.store._cached_fetch(
+            cache_key,
+            ver_keys,
+            build_fn,
+            max_age_on_clean=15.0 if is_heavy else 3.0,
+            min_fresh_on_dirty=12.0 if is_heavy else 2.0,
+            swr_max_age=30.0 if is_heavy else 4.0,
+            force_refresh=fresh,
+        )
+        return self._send_json_bytes(200, bundle['raw'], bundle.get('gz'))
     def authorized(self):
         if not KEY:
             return True
@@ -3058,30 +3411,33 @@ class Handler(BaseHTTPRequestHandler):
             if path_str == '/rules':
                 return self.send_json(200, self.store.rules())
             if path_str == '/journeys':
-                since_ms, to_ms, has_to = _parse_window_bounds(query, default_hours='24', allow_all=False)
+                since_ms, to_ms, has_to, win_spec, is_heavy_win = _parse_window_with_key(query, default_hours='24', allow_all=False)
                 plate = query.get('plate', [None])[0]
                 vtype_filter = (query.get('type', [None])[0] or query.get('vehicle_type', [None])[0] or '').strip().lower()
-                result = journeys(self.store, since_ms, plate)
-                if has_to:
-                    result = [v for v in result if v['first_at'] <= to_ms]
-                if vtype_filter and vtype_filter != 'all':
-                    norm_vt = normalize_vehicle_type(vtype_filter)
-                    result = [v for v in result if normalize_vehicle_type(v.get('vehicle_type')) == norm_vt]
+                fresh = query.get('fresh', ['0'])[0] == '1'
+                if not plate and (not vtype_filter or vtype_filter == 'all'):
+                    return self.send_cached_json(
+                        ('http_journeys', win_spec),
+                        ('meta', 'sightings'),
+                        lambda: (lambda res: _serialize_json_bundle({'journeys': res, 'count': len(res)}, heavy=is_heavy_win))(
+                            _cached_window_journeys(self.store, win_spec, is_heavy_win=is_heavy_win, fresh=fresh)
+                        ),
+                        is_heavy=is_heavy_win,
+                        fresh=fresh,
+                    )
+                base = _cached_window_journeys(self.store, win_spec, is_heavy_win=is_heavy_win, fresh=fresh)
+                result = _filter_journeys_list(base, plate_filter=plate, vtype_filter=vtype_filter)
                 return self.send_json(200, {'journeys': result, 'count': len(result)})
             if path_str in ('/journeys.csv', '/journeys/export'):
-                since_ms, to_ms, has_to = _parse_window_bounds(query, default_hours='24', allow_all=False)
+                since_ms, to_ms, has_to, win_spec, is_heavy_win = _parse_window_with_key(query, default_hours='24', allow_all=False)
                 plate = query.get('plate', [None])[0]
                 status_filter = query.get('status', [None])[0]
                 camera_filter = query.get('camera', [None])[0]
                 vtype_filter = (query.get('type', [None])[0] or query.get('vehicle_type', [None])[0] or '').strip().lower()
-                result = journeys(self.store, since_ms, plate)
-                if has_to:
-                    result = [v for v in result if v['first_at'] <= to_ms]
+                base = _cached_window_journeys(self.store, win_spec, is_heavy_win=is_heavy_win)
+                result = _filter_journeys_list(base, plate_filter=plate, vtype_filter=vtype_filter)
                 if status_filter:
                     result = [v for v in result if v['status'] == status_filter]
-                if vtype_filter and vtype_filter != 'all':
-                    norm_vt = normalize_vehicle_type(vtype_filter)
-                    result = [v for v in result if normalize_vehicle_type(v.get('vehicle_type')) == norm_vt]
                 if camera_filter:
                     result = [v for v in result if any(c['stream'] == camera_filter for c in v['cameras'])
                               or (v.get('entry') or {}).get('stream') == camera_filter
@@ -3127,24 +3483,44 @@ class Handler(BaseHTTPRequestHandler):
             if path_str == '/ambulances':
                 hours_q = str(query.get('hours', ['24'])[0]).lower()
                 if hours_q == 'today':
-                    now_sec = int(time.time())
-                    hrs = max(0.25, ((now_sec + IST_OFFSET_SEC) % 86400) / 3600.0)
+                    win_spec = ('today',)
+                    hrs = 24.0
+                    is_heavy_amb = False
                 else:
-                    hrs = min(720, max(1, float(hours_q)))
+                    hrs = min(720.0, max(1.0, float(hours_q)))
+                    win_spec = ('hours', round(hrs, 4))
+                    is_heavy_amb = hrs >= 48.0
                 limit_q = min(500, max(10, int(query.get('limit', ['200'])[0])))
-                return self.send_json(200, build_ambulance_list(self.store, hours=hrs, limit=limit_q))
+                fresh = query.get('fresh', ['0'])[0] == '1'
+                return self.send_cached_json(
+                    ('http_ambulances', win_spec, limit_q),
+                    ('meta', 'sightings', 'vc', 'amb'),
+                    lambda: _serialize_json_bundle(build_ambulance_list(self.store, hours=hrs, limit=limit_q, win_spec=win_spec, fresh=fresh), heavy=is_heavy_amb),
+                    is_heavy=is_heavy_amb,
+                    fresh=fresh,
+                )
             if path_str == '/vehicle-counts':
                 granularity = query.get('granularity', ['auto'])[0]
                 direction_q = query.get('direction', [None])[0]
                 vtype_q = query.get('type', [None])[0]
                 limit_q = min(20000, max(10, int(query.get('limit', ['60'])[0])))
-                from_ts, to_ts, _ = _parse_window_bounds(query, default_hours='24', allow_all=True)
-                summary = self.store.vehicle_counts_summary(
-                    from_ts=from_ts, to_ts=to_ts, granularity=granularity,
-                    event_limit=limit_q, direction=direction_q, vehicle_type=vtype_q
+                fresh = query.get('fresh', ['0'])[0] == '1'
+                from_ts, to_ts, has_to, win_spec, is_heavy_vc = _parse_window_with_key(query, default_hours='24', allow_all=True)
+                summary = self.store._cached_fetch(
+                    ('vc_summary', win_spec, granularity, limit_q, direction_q, vtype_q),
+                    ('meta', 'vc'),
+                    lambda: (lambda bounds: self.store.vehicle_counts_summary(
+                        from_ts=bounds[0], to_ts=bounds[1], granularity=granularity,
+                        event_limit=limit_q, direction=direction_q, vehicle_type=vtype_q
+                    ))(_resolve_win_spec(win_spec)),
+                    max_age_on_clean=12.0 if is_heavy_vc else 3.0,
+                    min_fresh_on_dirty=8.0 if is_heavy_vc else 1.5,
+                    swr_max_age=25.0 if is_heavy_vc else 3.0,
+                    force_refresh=fresh,
                 )
-                summary['remaining_cameras_live'] = self.engine.remaining_cameras_live()
-                return self.send_json(200, summary)
+                payload = dict(summary)
+                payload['remaining_cameras_live'] = self.engine.remaining_cameras_live()
+                return self.send_json(200, payload)
             if path_str in ('/vehicle-counts.csv', '/vehicle-counts/export'):
                 direction = query.get('direction', [None])[0]
                 vtype_q = query.get('type', [None])[0]
@@ -3175,34 +3551,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return self.wfile.write(payload)
             if path_str == '/analytics':
-                since, to_ms, has_to = _parse_window_bounds(query, default_hours='24', allow_all=False)
-                visits = journeys(self.store, since)
-                if has_to:
-                    visits = [v for v in visits if v['first_at'] <= to_ms]
-                # Compute today's start in IST timezone
-                now_sec = int(time.time())
-                seconds_today_in_ist = (now_sec + IST_OFFSET_SEC) % 86400
-                today = (now_sec - seconds_today_in_ist) * 1000
-                dwell = [v['dwell_ms'] for v in visits if v['status'] == 'exited']
-                per_camera = collections.Counter()
-                for v in visits:
-                    for cam in v['cameras']:
-                        per_camera[cam['stream']] += cam['reads']
-                bucket_ms = 3600000
-                hourly = collections.Counter()
-                for v in visits:
-                    # Align to IST hourly buckets
-                    ist_bucket = (v['first_at'] + IST_OFFSET_MS) // bucket_ms * bucket_ms - IST_OFFSET_MS
-                    hourly[ist_bucket] += 1
-                return self.send_json(200, {
-                    'vehicles_today': sum(1 for v in visits if v['first_at'] >= today),
-                    'on_site': sum(1 for v in visits if v['status'] == 'on_site'),
-                    'exited': sum(1 for v in visits if v['status'] == 'exited'),
-                    'unique_plates': len({v['plate'] for v in visits}),
-                    'avg_dwell_ms': int(sum(dwell) / len(dwell)) if dwell else None,
-                    'per_camera': dict(per_camera),
-                    'hourly_entries': [{'bucket': ts, 'count': n} for ts, n in sorted(hourly.items())],
-                })
+                since, to_ms, has_to, win_spec, is_heavy_win = _parse_window_with_key(query, default_hours='24', allow_all=False)
+                fresh = query.get('fresh', ['0'])[0] == '1'
+                def _build_analytics():
+                    visits = _cached_window_journeys(self.store, win_spec, is_heavy_win=is_heavy_win, fresh=fresh)
+                    return _serialize_json_bundle(_compute_analytics_from_visits(visits), heavy=is_heavy_win)
+                return self.send_cached_json(
+                    ('http_analytics', win_spec),
+                    ('meta', 'sightings'),
+                    _build_analytics,
+                    is_heavy=is_heavy_win,
+                    fresh=fresh,
+                )
             match = re.match(r'^/sightings/([a-f0-9]+)/(photo|plate)$', path_str)
             if match:
                 blob = self.store.sighting_photo(match.group(1), match.group(2))
@@ -3423,12 +3783,54 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(404, {'error': 'Not found'})
         except Exception as error:
             return self.send_json(400, {'error': str(error)[:200]})
+def _start_cache_warmer():
+    """Keep heavy 7d/24h analytics, journey, and gate-count caches hot in RAM without delaying requests."""
+    def _loop():
+        time.sleep(2.0)
+        while True:
+            try:
+                cur_store = Handler.store
+                if cur_store is not None:
+                    for win_spec, heavy in ((('hours', 168.0), True), (('hours', 24.0), False)):
+                        visits = _cached_window_journeys(cur_store, win_spec, is_heavy_win=heavy, fresh=False)
+                        if heavy and len(visits) >= 500:
+                            cur_store._cached_fetch(
+                                ('http_journeys', win_spec),
+                                ('meta', 'sightings'),
+                                lambda v=visits, h=heavy: _serialize_json_bundle({'journeys': v, 'count': len(v)}, heavy=h),
+                                max_age_on_clean=15.0,
+                                min_fresh_on_dirty=12.0,
+                                swr_max_age=30.0,
+                            )
+                            cur_store._cached_fetch(
+                                ('http_analytics', win_spec),
+                                ('meta', 'sightings'),
+                                lambda v=visits, h=heavy: _serialize_json_bundle(_compute_analytics_from_visits(v), heavy=h),
+                                max_age_on_clean=15.0,
+                                min_fresh_on_dirty=12.0,
+                                swr_max_age=30.0,
+                            )
+                            bounds = _resolve_win_spec(win_spec)
+                            cur_store._cached_fetch(
+                                ('vc_summary', win_spec, 'auto', 60, None, None),
+                                ('meta', 'vc'),
+                                lambda b=bounds: cur_store.vehicle_counts_summary(from_ts=b[0], to_ts=b[1], granularity='auto', event_limit=60),
+                                max_age_on_clean=12.0,
+                                min_fresh_on_dirty=8.0,
+                                swr_max_age=25.0,
+                            )
+            except Exception:
+                pass
+            time.sleep(15.0)
+    threading.Thread(target=_loop, daemon=True).start()
+
 def main():
     store = Store(DB_PATH)
     engine = Engine(store)
     Handler.store = store
     Handler.engine = engine
     engine.sync()
+    _start_cache_warmer()
     bind = os.environ.get('TRACKER_BIND', '0.0.0.0')
     port = int(os.environ.get('TRACKER_PORT', '8176'))
     print(f'Vehicle tracker ready on {bind}:{port}', flush=True)

@@ -2999,6 +2999,16 @@ function App() {
   const [addOpen, setAddOpen] = useState(false);
   const [editDevice, setEditDevice] = useState(null);
   const [searchPlate, setSearchPlate] = useState('');
+  const [debouncedSearchPlate, setDebouncedSearchPlate] = useState('');
+  useEffect(() => {
+    const trimmed = searchPlate.trim();
+    if (!trimmed) {
+      setDebouncedSearchPlate('');
+      return;
+    }
+    const tid = setTimeout(() => setDebouncedSearchPlate(trimmed), 300);
+    return () => clearTimeout(tid);
+  }, [searchPlate]);
   const [timeFilter, setTimeFilter] = useState('1h'); // '15m' | '30m' | '1h' | '2h' | '6h' | '12h' | '24h' | 'today' | 'custom'
   const [customStart, setCustomStart] = useState(() => {
     const d = new Date();
@@ -3048,6 +3058,7 @@ function App() {
   const vcReqRef = useRef(0);
   const jtReqRef = useRef(0);
   const ambReqRef = useRef(0);
+  const pollTickRef = useRef(0);
 
   const devices = state?.devices || [];
   const rules = state?.rules;
@@ -3138,7 +3149,7 @@ function App() {
       }
       const [analyticsData, journeyRes] = await Promise.all([
         api('/analytics?' + jtWindowQs),
-        api('/journeys?' + jtWindowQs + (searchPlate ? '&plate=' + encodeURIComponent(searchPlate) : ''))
+        api('/journeys?' + jtWindowQs + (debouncedSearchPlate ? '&plate=' + encodeURIComponent(debouncedSearchPlate) : ''))
       ]);
       if (reqId === jtReqRef.current) {
         setAnalytics(analyticsData);
@@ -3150,7 +3161,7 @@ function App() {
     } finally {
       if (reqId === jtReqRef.current) setJtLoading(false);
     }
-  }, [timeFilter, customStart, customEnd, searchPlate]);
+  }, [timeFilter, customStart, customEnd, debouncedSearchPlate]);
 
   const fetchVehicleCounts = useCallback(async (showLoader = false) => {
     const reqId = ++vcReqRef.current;
@@ -3185,23 +3196,30 @@ function App() {
     }
   }, [ambHours]);
 
-  const pollAll = useCallback(async (showLoaders = false) => {
+  const pollAll = useCallback(async (showLoaders = false, forceAll = false) => {
     try {
-      const [stateData] = await Promise.all([
-        api('/state'),
-        fetchTrafficAndJourneys(showLoaders),
-        fetchVehicleCounts(showLoaders),
-        fetchAmbulances(showLoaders),
-      ]);
+      const isBgTick = !showLoaders && !forceAll;
+      if (isBgTick && typeof document !== 'undefined' && document.hidden) return;
+      const tick = isBgTick ? (++pollTickRef.current) : 0;
+      const isJtHeavy = (timeFilter === '7d' || timeFilter === 'custom');
+      const isVcHeavy = (vcRange === '7d' || vcRange === 'all' || vcRange === 'custom');
+      const isAmbHeavy = (String(ambHours) === '168');
+
+      const tasks = [api('/state')];
+      if (!isBgTick || !isJtHeavy || (tick % 8 === 0)) tasks.push(fetchTrafficAndJourneys(showLoaders));
+      if (!isBgTick || !isVcHeavy || (tick % 8 === 0)) tasks.push(fetchVehicleCounts(showLoaders));
+      if (!isBgTick || !isAmbHeavy || (tick % 8 === 0)) tasks.push(fetchAmbulances(showLoaders));
+
+      const [stateData] = await Promise.all(tasks);
       if (stateData?.feed_mode) setFeedSource(stateData.feed_mode);
       setState(stateData);
       setError(null);
     } catch (err) {
       setError(err.message);
     }
-  }, [fetchTrafficAndJourneys, fetchVehicleCounts, fetchAmbulances]);
+  }, [fetchTrafficAndJourneys, fetchVehicleCounts, fetchAmbulances, timeFilter, vcRange, ambHours]);
 
-  const loadState = useCallback(() => pollAll(false), [pollAll]);
+  const loadState = useCallback(() => pollAll(false, true), [pollAll]);
 
   const handleToggleFeedSource = async () => {
     const nextMode = feedSource === 'demo' ? 'live' : 'demo';
