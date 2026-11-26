@@ -810,7 +810,13 @@ function JourneyFlow({ journey, expanded, onToggle, onOpenSightingPhoto }) {
         </td>
         <td>{journey.entry?.device || '—'}</td>
         <td style={{ whiteSpace: 'nowrap' }}>{ts(journey.first_at)}</td>
-        <td>{journey.exit?.device || '—'}</td>
+        <td>
+          {journey.exit ? (
+            journey.exit_confirmed === false
+              ? <span className="muted" style={{ fontSize: 11 }}>{journey.exit.device}</span>
+              : journey.exit.device
+          ) : '—'}
+        </td>
         <td style={{ whiteSpace: 'nowrap' }}>{journey.exit?.at ? ts(journey.exit.at) : '—'}</td>
         <td><b>{dwell(journey.dwell_ms)}</b></td>
         <td>

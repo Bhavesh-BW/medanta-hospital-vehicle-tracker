@@ -1720,14 +1720,41 @@ def journeys(store, since_ms, plate_filter=None):
         if exit_device.get('role') == 'exit':
             status, exited_at, exit_confirmed = 'exited', last['ts'], True
         elif now_ms - last['ts'] > grace_ms:
-            status, exited_at, exit_confirmed = 'exited', last['ts'], False
+            status, exited_at, exit_confirmed = 'exited', last['ts'] + grace_ms, False
         else:
             status, exited_at, exit_confirmed = 'on_site', None, False
         end = exited_at or now_ms
         j_vtype = _pick_journey_vtype(reads_v)
+        if exited_at and exit_confirmed:
+            exit_obj = {
+                'id': last.get('id'),
+                'stream': last['stream'],
+                'device': exit_device.get('name', last['stream']),
+                'role': exit_device.get('role', 'exit'),
+                'at': exited_at,
+                'photo_url': last['photo_url'],
+                'plate_url': last['plate_url'],
+                'confidence': last['confidence'],
+                'inferred': False,
+            }
+        elif exited_at:
+            grace_min_lbl = int(round(grace_ms / 60000))
+            exit_obj = {
+                'id': None,
+                'stream': None,
+                'device': f"Grace Timeout (+{grace_min_lbl}m)",
+                'role': None,
+                'at': exited_at,
+                'photo_url': None,
+                'plate_url': None,
+                'confidence': None,
+                'inferred': True,
+            }
+        else:
+            exit_obj = None
         out.append({'plate': plate, 'vehicle_type': j_vtype, 'status': status, 'exit_confirmed': exit_confirmed,
                     'entry': {'id': first.get('id'), 'stream': first['stream'], 'device': devices.get(first['stream'], {}).get('name', first['stream']), 'at': first['ts'], 'photo_url': first['photo_url'], 'plate_url': first['plate_url'], 'confidence': first['confidence']},
-                    'exit': {'id': last.get('id'), 'stream': last['stream'], 'device': devices.get(last['stream'], {}).get('name', last['stream']), 'at': exited_at, 'photo_url': last['photo_url'], 'plate_url': last['plate_url'], 'confidence': last['confidence']} if exited_at else None,
+                    'exit': exit_obj,
                     'cameras': cameras, 'camera_count': len(cameras), 'reads': len(reads_v),
                     'first_at': first['ts'], 'last_at': last['ts'], 'dwell_ms': max(0, end - first['ts'])})
     out.sort(key=lambda v: v['first_at'], reverse=True)
